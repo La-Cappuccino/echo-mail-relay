@@ -3,6 +3,7 @@ import { serve } from '@hono/node-server';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { findProjectByKeyHash, logSend, pool } from './db.js';
 import { brevoSend } from './brevo.js';
+import { renderTemplate, TemplateError } from './templates/index.js';
 
 const app = new Hono();
 
@@ -18,10 +19,11 @@ app.get('/health', async (c) => {
 interface SendBody {
   tier: 'transactional' | 'marketing';
   to: string;
-  subject: string;
-  html: string;
+  subject?: string; // optional when template is set (template provides default)
+  html?: string; // required unless template is set
   text?: string;
-  template?: string; // reserved: slice-2 relay-side rendering
+  template?: string; // relay-side rendering: `<project-id>/<name>` from the registry
+  data?: Record<string, unknown>; // template data
   replyTo?: string;
 }
 
@@ -54,8 +56,28 @@ app.post('/send', async (c) => {
     return c.json({ error: "tier must be 'transactional' or 'marketing'" }, 400);
   }
   if (!body.to || !EMAIL_RE.test(body.to)) return c.json({ error: 'invalid recipient' }, 400);
-  if (!body.subject) return c.json({ error: 'missing subject' }, 400);
-  if (!body.html) return c.json({ error: 'missing html' }, 400);
+
+  // --- relay-side template rendering (SPEC assumption 4) ---
+  let subject = body.subject;
+  let html = body.html;
+  let text = body.text;
+  if (body.template) {
+    // a project may only render templates in its own namespace
+    if (!body.template.startsWith(`${project.id}/`)) {
+      return c.json({ error: `template outside project namespace '${project.id}/'` }, 403);
+    }
+    try {
+      const rendered = await renderTemplate(body.template, body.data ?? {});
+      subject = subject ?? rendered.subject;
+      html = rendered.html;
+      text = rendered.text;
+    } catch (err) {
+      if (err instanceof TemplateError) return c.json({ error: err.message }, 400);
+      throw err;
+    }
+  }
+  if (!subject) return c.json({ error: 'missing subject' }, 400);
+  if (!html) return c.json({ error: 'missing html (or template)' }, 400);
 
   // --- tiered kill-switch (SPEC D4) ---
   // hard_off blocks everything (decommissioned project).
@@ -70,7 +92,7 @@ app.post('/send', async (c) => {
       tier: body.tier,
       template: body.template,
       recipient: body.to,
-      subject: body.subject,
+      subject: subject,
       status: 'suppressed',
       suppress_reason: suppressReason,
     });
@@ -88,9 +110,9 @@ app.post('/send', async (c) => {
       fromEmail: project.from_email,
       fromName: project.from_name,
       to: body.to,
-      subject: body.subject,
-      html: body.html,
-      text: body.text,
+      subject: subject,
+      html: html,
+      text: text,
       replyTo: body.replyTo,
     });
     await logSend({
@@ -98,7 +120,7 @@ app.post('/send', async (c) => {
       tier: body.tier,
       template: body.template,
       recipient: body.to,
-      subject: body.subject,
+      subject: subject,
       status: 'sent',
       brevo_message_id: messageId,
     });
@@ -110,7 +132,7 @@ app.post('/send', async (c) => {
       tier: body.tier,
       template: body.template,
       recipient: body.to,
-      subject: body.subject,
+      subject: subject,
       status: 'failed',
       error: message,
     });
