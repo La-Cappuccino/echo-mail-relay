@@ -3,6 +3,15 @@ import { serve } from '@hono/node-server';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { findProjectByKeyHash, logSend, pool } from './db.js';
 import { brevoSend } from './brevo.js';
+import { mailersendSend } from './mailersend.js';
+
+// Provider selector. Default MailerSend (Brevo's SMTP account is not activated
+// — 403). Set EMAIL_PROVIDER=brevo to switch back. Both share one input/output
+// shape, so the call site is provider-agnostic.
+const providerSend =
+  (process.env.EMAIL_PROVIDER ?? 'mailersend').toLowerCase() === 'brevo'
+    ? brevoSend
+    : mailersendSend;
 import { renderTemplate, TemplateError } from './templates/index.js';
 
 const app = new Hono();
@@ -104,9 +113,9 @@ app.post('/send', async (c) => {
     return c.json({ ok: true, suppressed: true, reason: suppressReason });
   }
 
-  // --- send via Brevo ---
+  // --- send via the selected provider (MailerSend default, Brevo fallback) ---
   try {
-    const { messageId } = await brevoSend({
+    const { messageId } = await providerSend({
       fromEmail: project.from_email,
       fromName: project.from_name,
       to: body.to,
