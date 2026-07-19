@@ -2,17 +2,15 @@ import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { findProjectByKeyHash, logSend, pool } from './db.js';
-import { brevoSend } from './brevo.js';
 import { mailersendSend } from './mailersend.js';
-
-// Provider selector. Default MailerSend (Brevo's SMTP account is not activated
-// — 403). Set EMAIL_PROVIDER=brevo to switch back. Both share one input/output
-// shape, so the call site is provider-agnostic.
-const providerSend =
-  (process.env.EMAIL_PROVIDER ?? 'mailersend').toLowerCase() === 'brevo'
-    ? brevoSend
-    : mailersendSend;
 import { renderTemplate, TemplateError } from './templates/index.js';
+
+// MailerSend is the sole email provider. Brevo was removed 2026-07-19 (its SMTP
+// account was never activated — 403 for days). The Brevo client and credentials
+// are archived for restore, not lost: git history holds src/brevo.ts, and the
+// keys live in Vaultwarden (keychain:brevo-api-key-rnb-vault et al.). To bring
+// Brevo back, restore src/brevo.ts, re-add the EMAIL_PROVIDER selector, and set
+// BREVO_API_KEY. See the relay README (§ Providers).
 
 const app = new Hono();
 
@@ -113,9 +111,9 @@ app.post('/send', async (c) => {
     return c.json({ ok: true, suppressed: true, reason: suppressReason });
   }
 
-  // --- send via the selected provider (MailerSend default, Brevo fallback) ---
+  // --- send via MailerSend ---
   try {
-    const { messageId } = await providerSend({
+    const { messageId } = await mailersendSend({
       fromEmail: project.from_email,
       fromName: project.from_name,
       to: body.to,
