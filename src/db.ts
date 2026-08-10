@@ -26,7 +26,7 @@ export async function findProjectByKeyHash(hash: string): Promise<Project | null
   return rows[0] ?? null;
 }
 
-export async function logSend(entry: {
+export interface SendLogEntry {
   project_id: string;
   tier: string;
   template?: string | null;
@@ -34,9 +34,15 @@ export async function logSend(entry: {
   subject: string;
   status: 'sent' | 'suppressed' | 'failed';
   suppress_reason?: string | null;
-  brevo_message_id?: string | null;
+  // Provider message id. Stored in the legacy `brevo_message_id` column
+  // (schema v0 predates the MailerSend cutover); the column is NOT renamed —
+  // this relay is its sole reader/writer, so a rename or compat view would
+  // add migration risk for zero benefit. See README § Send log.
+  provider_message_id?: string | null;
   error?: string | null;
-}): Promise<void> {
+}
+
+export async function logSend(entry: SendLogEntry): Promise<void> {
   await pool.query(
     `INSERT INTO sends (project_id, tier, template, recipient, subject, status, suppress_reason, brevo_message_id, error)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
@@ -48,7 +54,7 @@ export async function logSend(entry: {
       entry.subject,
       entry.status,
       entry.suppress_reason ?? null,
-      entry.brevo_message_id ?? null,
+      entry.provider_message_id ?? null,
       entry.error ?? null,
     ],
   );
