@@ -165,15 +165,19 @@ auth mail.
 | recipient budget | project id, **weighted by recipient count** | `POST /send-bulk` only | `BULK_RECIPIENTS_PER_HOUR` (2000) |
 
 The recipient budget is confirmed before the rendered-size preflight and
-charged after it, so nothing a refused request never used is spent: a
-suppressed, size-refused or rate-refused batch costs zero budget. The bulk
-request limiter sits after the kill-switch, so a project whose marketing is off
-cannot burn its own allowance by retrying.
+The bulk request slot and the recipient budget are both confirmed before the
+rendered-size preflight and charged together immediately after it, so a
+request the preflight refuses spends neither. Suppressed, size-refused and
+rate-refused batches all cost nothing. The bulk request limiter sits after the
+kill-switch, so a project whose marketing is off cannot burn its own allowance
+by retrying.
 
 Body cap: **2 MB**, enforced while reading rather than after — the stream is
-counted as it arrives and cancelled the moment it passes the cap, so a caller
-omitting `Content-Length` cannot make the relay buffer arbitrary memory.
-Recipients are capped at **500 per call**.
+counted as it arrives, and reading stops and the body is cancelled once the
+count passes the cap. The guarantee is on **buffering**: the relay never holds
+more than the cap, so a caller omitting `Content-Length` cannot make it buffer
+arbitrary memory. Releasing the underlying socket is the Node adapter's
+business and may lag the cancel. Recipients are capped at **500 per call**.
 
 ## Send log
 

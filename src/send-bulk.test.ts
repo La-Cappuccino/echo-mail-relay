@@ -790,7 +790,7 @@ function chunkedBody(maxChunks: number) {
   return { stream, state };
 }
 
-test('a chunked body with no content-length is cut off the moment it passes the cap', async () => {
+test('a chunked body with no content-length has its buffering bounded at the cap', async () => {
   const { app, batches } = makeHarness();
   const available = 200; // 12.8 MB if fully drained
   const { stream, state } = chunkedBody(available);
@@ -805,8 +805,8 @@ test('a chunked body with no content-length is cut off the moment it passes the 
   assert.equal(res.status, 413);
   assert.match((await res.json()).error, /too large/);
   assert.equal(batches.length, 0);
-  // The reader stopped early instead of buffering the whole source: the cap is
-  // 2 MB, so it should have pulled ~33 of the 200 available chunks.
+  // Buffering is bounded: the reader stopped pulling once past the 2 MB cap,
+  // having taken ~33 of the 200 chunks the source could have supplied.
   assert.ok(state.pulled < available, `reader drained the whole source (pulled=${state.pulled})`);
   assert.ok(
     state.pulled <= MAX_BULK_BODY_BYTES / CHUNK_BYTES + 2,

@@ -132,10 +132,12 @@ export function keyHashMatches(storedHex: string, givenHex: string): boolean {
  *
  * Measuring after `req.text()` would buffer the whole stream first, so a
  * caller omitting Content-Length could make the relay hold an arbitrary
- * amount of memory before being told the body is too large. This counts as
- * it reads and cancels the source the moment the cap is passed. Chunks are
- * concatenated before decoding, so a multi-byte character split across a
- * chunk boundary survives.
+ * amount of memory before being told the body is too large. This counts as it
+ * reads, and stops reading once the cap is passed. The guarantee is on
+ * BUFFERING — never more than `max` is held. When the underlying socket is
+ * actually released is the Node adapter's business and may lag the cancel.
+ * Chunks are concatenated before decoding, so a multi-byte character split
+ * across a chunk boundary survives.
  */
 export async function readBoundedBody(
   stream: ReadableStream<Uint8Array> | null,
