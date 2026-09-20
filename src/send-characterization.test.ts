@@ -1,8 +1,9 @@
-// Characterization tests for POST /send — written BEFORE any /send refactor
-// so the shared surface (RnB Vault mail + afrobeats.no auth mail) is pinned,
-// not just described. These assert the CURRENT behaviour, including the exact
-// ORDER of checks: every later slice may extract pure helpers, but a helper
-// must be called from the same position or one of these fails.
+// Characterization tests for POST /send — written BEFORE any /send refactor.
+// More than one product's transactional and auth mail goes through this route,
+// so its behaviour is pinned here rather than merely described. These assert
+// the CURRENT behaviour, including the exact ORDER of checks: a later slice may
+// extract pure helpers, but a helper must be called from the same position or
+// one of these fails.
 //
 // Anything asserted here is load-bearing for a live caller. Do not "fix" a
 // surprise found here — change it deliberately, in its own commit.

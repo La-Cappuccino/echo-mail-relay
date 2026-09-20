@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run build
+
+      # No DATABASE_URL and no MAILERSEND_API_KEY on purpose: every test
+      # injects its own fakes, so a green run here proves the suite never
+      # reaches Postgres or the provider.
+      - run: npm test
