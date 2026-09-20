@@ -21,8 +21,13 @@ export class RateLimiter {
 
   constructor(private opts: RateLimiterOptions) {}
 
-  /** Take one token for `key`. Returns false when the caller is rate-limited. */
-  take(key: string, now = Date.now()): boolean {
+  /**
+   * Take `cost` tokens for `key`. Returns false when the caller is rate-limited,
+   * and in that case spends nothing. A weighted cost is how one bulk request
+   * can be charged for the recipients it carries rather than counting as one
+   * call (a 500-recipient send must not be as cheap as a single mail).
+   */
+  take(key: string, cost = 1, now = Date.now()): boolean {
     this.prune(now);
     let bucket = this.buckets.get(key);
     if (!bucket) {
@@ -33,8 +38,8 @@ export class RateLimiter {
       bucket.tokens = Math.min(this.opts.capacity, bucket.tokens + elapsedSec * this.opts.refillPerSec);
       bucket.last = now;
     }
-    if (bucket.tokens < 1) return false;
-    bucket.tokens -= 1;
+    if (bucket.tokens < cost) return false;
+    bucket.tokens -= cost;
     return true;
   }
 
