@@ -1,6 +1,6 @@
 import { serve } from '@hono/node-server';
 import { createApp } from './app.js';
-import { findProjectByKeyHash, logSend, logSends, pool } from './db.js';
+import { findProjectByKeyHash, logSend, logSends, ownsBulkId, pool } from './db.js';
 import { getBulkStatus, mailersendSend, sendBulkEmail } from './mailersend.js';
 
 // MailerSend is the sole email provider. Brevo was removed 2026-07-19 (its SMTP
@@ -17,6 +17,7 @@ const app = createApp({
   sendEmail: mailersendSend,
   sendBulkEmail,
   getBulkStatus,
+  ownsBulkId,
   checkHealth: async () => {
     await pool.query('SELECT 1');
   },

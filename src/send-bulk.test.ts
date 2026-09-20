@@ -41,17 +41,26 @@ const PROJECTS: Project[] = [
   project('decommissioned', KEYS.hardOff, { hard_off: true }),
 ];
 
+// Which batches each project has on record. The status read must prove
+// ownership from this before it will ask the provider anything.
+const OWNED_BULK_IDS: Record<string, string[]> = {
+  afrobeats: ['bulk-1', '614470d1588b866d0454f3e2', 'a_b-c', 'x'.repeat(64)],
+  'marketing-off': ['bulk-mo'],
+};
+
 interface Harness {
   app: ReturnType<typeof createApp>;
   logged: SendLogEntry[][]; // one array per logSends() call
   batches: MailerSendInput[][]; // one array per sendBulkEmail() call
   statusReads: string[];
+  ownershipChecks: [string, string][];
 }
 
 function makeHarness(overrides: Partial<AppDeps> = {}): Harness {
   const logged: SendLogEntry[][] = [];
   const batches: MailerSendInput[][] = [];
   const statusReads: string[] = [];
+  const ownershipChecks: [string, string][] = [];
   const app = createApp({
     findProjectByKeyHash: async (hash) => PROJECTS.find((p) => p.api_key_hash === hash) ?? null,
     logSend: async () => {},
@@ -62,6 +71,10 @@ function makeHarness(overrides: Partial<AppDeps> = {}): Harness {
     sendBulkEmail: async (inputs) => {
       batches.push(inputs);
       return { bulkEmailId: 'bulk-1' };
+    },
+    ownsBulkId: async (projectId, id) => {
+      ownershipChecks.push([projectId, id]);
+      return (OWNED_BULK_IDS[projectId] ?? []).includes(id);
     },
     getBulkStatus: async (id): Promise<BulkStatus> => {
       statusReads.push(id);
@@ -76,7 +89,7 @@ function makeHarness(overrides: Partial<AppDeps> = {}): Harness {
     recipientLimiter: new RateLimiter({ capacity: 100_000, refillPerSec: 100_000 }),
     ...overrides,
   });
-  return { app, logged, batches, statusReads };
+  return { app, logged, batches, statusReads, ownershipChecks };
 }
 
 function postBulk(app: Harness['app'], key: string | null, body: unknown, ip?: string) {
@@ -986,4 +999,52 @@ test('a payload refused for size is refused for size, not mislabelled as a body-
   const res = await postBulk(app, KEYS.normal, AMPLIFYING);
   assert.equal(res.status, 413);
   assert.equal((await res.json()).error.includes('body too large'), false);
+});
+
+// --- the status read must prove ownership (Codex #4) ---
+
+test('a project cannot read another project\'s batch', async () => {
+  const { app, statusReads } = makeHarness();
+  // 'bulk-1' belongs to afrobeats; marketing-off holds a valid key of its own
+  const res = await getStatus(app, KEYS.marketingOff, 'bulk-1');
+  assert.equal(res.status, 404);
+  assert.deepEqual(await res.json(), { error: 'not found' });
+  assert.equal(statusReads.length, 0, 'the provider must not be asked at all');
+});
+
+test('an id that was never recorded → 404, no provider call', async () => {
+  const { app, statusReads } = makeHarness();
+  const res = await getStatus(app, KEYS.normal, 'never-seen-id');
+  assert.equal(res.status, 404);
+  assert.equal(statusReads.length, 0);
+});
+
+test('a project reads its own batch', async () => {
+  const { app, statusReads, ownershipChecks } = makeHarness();
+  assert.equal((await getStatus(app, KEYS.normal, 'bulk-1')).status, 200);
+  assert.deepEqual(ownershipChecks, [['afrobeats', 'bulk-1']]);
+  assert.deepEqual(statusReads, ['bulk-1']);
+});
+
+test('ownership is checked after the id shape, so a malformed id never hits the DB', async () => {
+  const { app, ownershipChecks } = makeHarness();
+  assert.equal((await getStatus(app, KEYS.normal, 'a!b')).status, 400);
+  assert.equal(ownershipChecks.length, 0);
+});
+
+test('an ownership lookup failure fails closed, it does not fall through to the provider', async () => {
+  const original = console.error;
+  console.error = () => {};
+  try {
+    const { app, statusReads } = makeHarness({
+      ownsBulkId: async () => {
+        throw new Error('db down');
+      },
+    });
+    const res = await getStatus(app, KEYS.normal, 'bulk-1');
+    assert.equal(res.status, 503);
+    assert.equal(statusReads.length, 0);
+  } finally {
+    console.error = original;
+  }
 });

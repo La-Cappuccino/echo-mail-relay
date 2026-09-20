@@ -19,6 +19,8 @@ export interface AppDeps {
   sendEmail(input: MailerSendInput): Promise<{ messageId: string }>;
   sendBulkEmail(inputs: MailerSendInput[]): Promise<{ bulkEmailId: string }>;
   getBulkStatus(bulkEmailId: string): Promise<BulkStatus>;
+  /** Has this project a send-log row for this bulk id? Gates the status read. */
+  ownsBulkId(projectId: string, bulkEmailId: string): Promise<boolean>;
   checkHealth(): Promise<void>;
   // Overridable for tests; defaults come from env (SPEC D2).
   ipLimiter?: RateLimiter;
@@ -500,6 +502,19 @@ export function createApp(deps: AppDeps): Hono {
 
     const bulkEmailId = c.req.param('bulkEmailId');
     if (!BULK_ID_RE.test(bulkEmailId)) return c.json({ error: 'invalid bulk email id' }, 400);
+
+    // Authentication alone would let any project read any batch, provider
+    // payload included. Ownership comes from our own send log, and is proved
+    // before the provider is asked anything. A lookup failure fails closed.
+    let owned: boolean;
+    try {
+      owned = await deps.ownsBulkId(project.id, bulkEmailId);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'unknown error';
+      console.error(`[relay] bulk ownership check failed project=${project.id}:`, message);
+      return c.json({ error: 'ownership check unavailable' }, 503);
+    }
+    if (!owned) return c.json({ error: 'not found' }, 404);
 
     try {
       const status = await deps.getBulkStatus(bulkEmailId);

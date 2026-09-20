@@ -26,6 +26,20 @@ export async function findProjectByKeyHash(hash: string): Promise<Project | null
   return rows[0] ?? null;
 }
 
+/**
+ * Does this project have a send-log row for this provider id? The bulk status
+ * read uses it to prove ownership before asking MailerSend about a batch —
+ * authentication alone would let any valid project key read any other
+ * project's batch, provider payload included.
+ */
+export async function ownsBulkId(projectId: string, bulkEmailId: string): Promise<boolean> {
+  const { rows } = await pool.query(
+    'SELECT 1 FROM sends WHERE project_id = $1 AND brevo_message_id = $2 LIMIT 1',
+    [projectId, bulkEmailId],
+  );
+  return rows.length > 0;
+}
+
 export interface SendLogEntry {
   project_id: string;
   tier: string;
