@@ -17,6 +17,11 @@ export interface AppDeps {
   // Overridable for tests; defaults come from env (SPEC D2).
   ipLimiter?: RateLimiter;
   keyLimiter?: RateLimiter;
+  // Bulk has its OWN pre-auth buckets. Sharing /send's would let a burst of
+  // bulk attempts (or status polling) rate-limit transactional and auth mail
+  // from the same IP or project key.
+  bulkIpLimiter?: RateLimiter;
+  bulkKeyLimiter?: RateLimiter;
   bulkLimiter?: RateLimiter;
   recipientLimiter?: RateLimiter;
 }
@@ -47,6 +52,13 @@ const BULK_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 function defaultLimiter(): RateLimiter {
   const perMin = Number(process.env.RATE_LIMIT_PER_MINUTE ?? 60);
   const burst = Number(process.env.RATE_LIMIT_BURST ?? 20);
+  return new RateLimiter({ capacity: burst, refillPerSec: perMin / 60 });
+}
+
+/** Pre-auth buckets for the bulk routes — same shape as /send's, own tokens. */
+function defaultBulkPreAuthLimiter(): RateLimiter {
+  const perMin = Number(process.env.BULK_RATE_LIMIT_PER_MINUTE ?? 60);
+  const burst = Number(process.env.BULK_RATE_LIMIT_BURST ?? 20);
   return new RateLimiter({ capacity: burst, refillPerSec: perMin / 60 });
 }
 
@@ -92,8 +104,11 @@ export function createApp(deps: AppDeps): Hono {
   // hash (post-hash, per-project fairness + shields the DB from key brute force).
   const ipLimiter = deps.ipLimiter ?? defaultLimiter();
   const keyLimiter = deps.keyLimiter ?? defaultLimiter();
-  // Bulk gets its OWN buckets so a newsletter can never starve auth mail:
-  // one for request frequency, one weighted by recipients per project.
+  // Bulk gets its OWN buckets, all four of them, so a newsletter can never
+  // starve auth mail: its own pre-auth IP and key buckets, one for request
+  // frequency, and one weighted by recipients per project.
+  const bulkIpLimiter = deps.bulkIpLimiter ?? defaultBulkPreAuthLimiter();
+  const bulkKeyLimiter = deps.bulkKeyLimiter ?? defaultBulkPreAuthLimiter();
   const bulkLimiter = deps.bulkLimiter ?? defaultBulkLimiter();
   const recipientLimiter = deps.recipientLimiter ?? defaultRecipientLimiter();
 
@@ -238,18 +253,20 @@ export function createApp(deps: AppDeps): Hono {
 
   type BulkAuth = { project: Project; hash: string } | { error: Response };
 
+  // Note the limiters: bulkIpLimiter / bulkKeyLimiter, never /send's. A caller
+  // hammering this route must not be able to rate-limit its own auth mail.
   async function authenticateBulk(c: Context): Promise<BulkAuth> {
     const ip = firstForwardedHop(c.req.header('x-forwarded-for'));
-    if (!ipLimiter.take(`ip:${ip}`)) {
-      console.warn(`[relay] rate limited ip=${ip}`);
+    if (!bulkIpLimiter.take(`ip:${ip}`)) {
+      console.warn(`[relay] bulk rate limited ip=${ip}`);
       return { error: c.json({ error: 'rate limited' }, 429) };
     }
     const key = bearerKeyFrom(c.req.header('authorization'));
     if (!key) return { error: c.json({ error: 'missing bearer token' }, 401) };
 
     const hash = hashKey(key);
-    if (!keyLimiter.take(`key:${hash}`)) {
-      console.warn(`[relay] rate limited key=${hash.slice(0, 8)}…`);
+    if (!bulkKeyLimiter.take(`key:${hash}`)) {
+      console.warn(`[relay] bulk rate limited key=${hash.slice(0, 8)}…`);
       return { error: c.json({ error: 'rate limited' }, 429) };
     }
 

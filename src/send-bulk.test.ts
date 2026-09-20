@@ -69,6 +69,8 @@ function makeHarness(overrides: Partial<AppDeps> = {}): Harness {
     checkHealth: async () => {},
     ipLimiter: new RateLimiter({ capacity: 100_000, refillPerSec: 100_000 }),
     keyLimiter: new RateLimiter({ capacity: 100_000, refillPerSec: 100_000 }),
+    bulkIpLimiter: new RateLimiter({ capacity: 100_000, refillPerSec: 100_000 }),
+    bulkKeyLimiter: new RateLimiter({ capacity: 100_000, refillPerSec: 100_000 }),
     bulkLimiter: new RateLimiter({ capacity: 100_000, refillPerSec: 100_000 }),
     recipientLimiter: new RateLimiter({ capacity: 100_000, refillPerSec: 100_000 }),
     ...overrides,
@@ -87,9 +89,10 @@ function postBulk(app: Harness['app'], key: string | null, body: unknown, ip?: s
   });
 }
 
-function getStatus(app: Harness['app'], key: string | null, id: string) {
+function getStatus(app: Harness['app'], key: string | null, id: string, ip?: string) {
   const headers: Record<string, string> = {};
   if (key !== null) headers.authorization = `Bearer ${key}`;
+  if (ip) headers['x-forwarded-for'] = ip;
   return app.request(`/send-bulk/${id}`, { method: 'GET', headers });
 }
 
@@ -177,13 +180,13 @@ test('auth: missing token → 401, unknown key → 401, and nothing is sent', as
   assert.equal(batches.length, 0);
 });
 
-test('auth: the IP bucket is checked before auth, the key bucket before the DB lookup', async () => {
-  const noIp = makeHarness({ ipLimiter: new RateLimiter({ capacity: 0, refillPerSec: 0 }) });
+test('auth: the bulk IP bucket is checked before auth, the bulk key bucket before the DB lookup', async () => {
+  const noIp = makeHarness({ bulkIpLimiter: new RateLimiter({ capacity: 0, refillPerSec: 0 }) });
   assert.equal((await postBulk(noIp.app, null, BASE, '203.0.113.5')).status, 429);
 
   let lookups = 0;
   const noKey = makeHarness({
-    keyLimiter: new RateLimiter({ capacity: 0, refillPerSec: 0 }),
+    bulkKeyLimiter: new RateLimiter({ capacity: 0, refillPerSec: 0 }),
     findProjectByKeyHash: async () => {
       lookups += 1;
       return null;
@@ -678,4 +681,77 @@ test('status: a hard-off project cannot read batches either', async () => {
   const res = await getStatus(app, KEYS.hardOff, 'bulk-1');
   assert.equal(res.status, 403);
   assert.equal(statusReads.length, 0);
+});
+
+// --- bulk must not starve transactional mail (Codex #1) ---
+
+/** A single-send request, used to prove /send's buckets are untouched. */
+function postSend(app: Harness['app'], key: string, ip?: string) {
+  const headers: Record<string, string> = {
+    authorization: `Bearer ${key}`,
+    'content-type': 'application/json',
+  };
+  if (ip) headers['x-forwarded-for'] = ip;
+  return app.request('/send', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      tier: 'transactional',
+      to: 'user@example.com',
+      subject: 'Hi',
+      html: '<p>hi</p>',
+    }),
+  });
+}
+
+test('draining the bulk pre-auth buckets leaves /send untouched', async () => {
+  // Realistic shape: both routes given a 20-burst bucket, as in production.
+  const { app } = makeHarness({
+    ipLimiter: new RateLimiter({ capacity: 20, refillPerSec: 0 }),
+    keyLimiter: new RateLimiter({ capacity: 20, refillPerSec: 0 }),
+    bulkIpLimiter: new RateLimiter({ capacity: 20, refillPerSec: 0 }),
+    bulkKeyLimiter: new RateLimiter({ capacity: 20, refillPerSec: 0 }),
+    bulkLimiter: new RateLimiter({ capacity: 1000, refillPerSec: 0 }),
+  });
+  const ip = '203.0.113.20';
+
+  // 25 bulk attempts: the bulk pre-auth buckets empty at 20.
+  let bulkLimited = 0;
+  for (let i = 0; i < 25; i += 1) {
+    if ((await postBulk(app, KEYS.normal, BASE, ip)).status === 429) bulkLimited += 1;
+  }
+  assert.ok(bulkLimited > 0, 'bulk should have been rate limited');
+
+  // Auth mail from the same IP and the same key still goes out.
+  assert.equal((await postSend(app, KEYS.normal, ip)).status, 200);
+});
+
+test('status polling drains only the bulk buckets', async () => {
+  const { app } = makeHarness({
+    ipLimiter: new RateLimiter({ capacity: 20, refillPerSec: 0 }),
+    keyLimiter: new RateLimiter({ capacity: 20, refillPerSec: 0 }),
+    bulkIpLimiter: new RateLimiter({ capacity: 5, refillPerSec: 0 }),
+    bulkKeyLimiter: new RateLimiter({ capacity: 5, refillPerSec: 0 }),
+  });
+  const ip = '203.0.113.21';
+  for (let i = 0; i < 5; i += 1) {
+    assert.equal((await getStatus(app, KEYS.normal, 'bulk-1', ip)).status, 200);
+  }
+  assert.equal((await getStatus(app, KEYS.normal, 'bulk-1', ip)).status, 429);
+  assert.equal((await postSend(app, KEYS.normal, ip)).status, 200);
+});
+
+test('draining /send leaves bulk untouched', async () => {
+  const { app } = makeHarness({
+    ipLimiter: new RateLimiter({ capacity: 2, refillPerSec: 0 }),
+    keyLimiter: new RateLimiter({ capacity: 2, refillPerSec: 0 }),
+    bulkIpLimiter: new RateLimiter({ capacity: 20, refillPerSec: 0 }),
+    bulkKeyLimiter: new RateLimiter({ capacity: 20, refillPerSec: 0 }),
+  });
+  const ip = '203.0.113.22';
+  assert.equal((await postSend(app, KEYS.normal, ip)).status, 200);
+  assert.equal((await postSend(app, KEYS.normal, ip)).status, 200);
+  assert.equal((await postSend(app, KEYS.normal, ip)).status, 429);
+
+  assert.equal((await postBulk(app, KEYS.normal, BASE, ip)).status, 200);
 });
