@@ -56,3 +56,52 @@ test('an explicit `now` is still honoured as the third argument', () => {
   assert.equal(limiter.take('a', 1, t0), false);
   assert.equal(limiter.take('a', 1, t0 + 1_000), true);
 });
+
+// --- prune must not hand back budget (Codex #7) ---
+
+test('prune never evicts a bucket that is still depleted', () => {
+  // The hourly recipient budget refills at ~0.56 tokens/s, so a bucket idle
+  // for a minute is nowhere near full. Evicting it would recreate it at full
+  // capacity — i.e. silently refund a spent budget.
+  const limiter = new RateLimiter({ capacity: 2000, refillPerSec: 2000 / 3600 });
+  const t0 = 1_000_000;
+  assert.equal(limiter.take('project:a', 2000, t0), true);
+
+  // Force a prune sweep by pushing the map past its threshold.
+  const later = t0 + 120_000;
+  for (let i = 0; i < 10_050; i += 1) limiter.take(`filler:${i}`, 1, later);
+
+  // 120s × 0.56/s ≈ 67 tokens back — not 2000.
+  assert.equal(limiter.take('project:a', 500, later), false);
+  assert.equal(limiter.take('project:a', 60, later), true);
+});
+
+test('prune still evicts buckets that have fully replenished', () => {
+  const limiter = new RateLimiter({ capacity: 10, refillPerSec: 10 });
+  const t0 = 1_000_000;
+  assert.equal(limiter.take('spent', 10, t0), true);
+
+  // 10s later `spent` is back to capacity, so it is safe to drop.
+  const later = t0 + 10_000;
+  for (let i = 0; i < 10_050; i += 1) limiter.take(`filler:${i}`, 1, later);
+  assert.equal(limiter.size, 10_050, 'the replenished bucket should have been pruned');
+});
+
+// --- canTake: check without spending (needed to preflight before charging) ---
+
+test('canTake reports availability without spending anything', () => {
+  const limiter = new RateLimiter({ capacity: 5, refillPerSec: 0 });
+  assert.equal(limiter.canTake('a', 5), true);
+  assert.equal(limiter.canTake('a', 5), true); // still true — nothing was spent
+  assert.equal(limiter.canTake('a', 6), false);
+  assert.equal(limiter.take('a', 5), true);
+  assert.equal(limiter.canTake('a', 1), false);
+});
+
+test('canTake accounts for refill the same way take does', () => {
+  const limiter = new RateLimiter({ capacity: 10, refillPerSec: 1 });
+  const t0 = 1_000_000;
+  assert.equal(limiter.take('a', 10, t0), true);
+  assert.equal(limiter.canTake('a', 5, t0), false);
+  assert.equal(limiter.canTake('a', 5, t0 + 5_000), true);
+});
