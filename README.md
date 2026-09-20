@@ -40,18 +40,45 @@ POST /send-bulk            Authorization: Bearer <project key>
 | `200 {ok:true, bulkEmailId, accepted, logged}` | accepted by MailerSend. `logged:false` means the send-log write failed *after* the provider accepted — the mail still went out |
 | `200 {ok:true, suppressed:true, reason:"marketing_disabled"}` | kill-switch; **nothing was sent** |
 | `400` | validation or substitution error; nothing sent |
-| `401` bad key · `403` hard-off · `413` body > 2 MB · `429` rate or budget | nothing sent |
+| `401` bad key · `403` hard-off · `429` rate or budget | nothing sent |
+| `413` | the request body exceeds 2 MB, **or** the *rendered* output would exceed its caps (see Rendered-size caps); nothing sent |
 | `502 {error, outcome:"rejected"}` | provider 4xx, or a paused account — **provably nothing was sent** |
 | `502 {error, outcome:"unknown"}` | provider 5xx, 15 s timeout, network error, or an accept with no usable `bulk_email_id`. It may or may not have gone out — **do not resend**; reconcile with the status read |
+
+Order of checks: auth → body cap → validation → kill-switch → bulk request
+limiter → recipient budget → rendered-size preflight → render → provider.
+Nothing is rendered until every gate has passed, and a request refused by any
+of them spends no recipient budget.
 
 ```json
 GET /send-bulk/:bulkEmailId        (same auth)
 → 200 { "ok": true, "state": "…", "validationErrorsCount": 0, "suppressedCount": 0, "raw": { … } }
+→ 404 { "error": "not found" }     // not this project's batch, or not recorded
 ```
 
 The id must be a plain token (`^[A-Za-z0-9_-]{1,64}$`) before it is placed in a
-provider URL. A `hard_off` project cannot read batches; a `marketing_enabled=false`
-one can, so an already-sent batch stays reconcilable after the switch is flipped.
+provider URL. Ownership is then proved against this relay's own send log, so a
+project can only read batches it actually sent; an id belonging to someone else
+and an id that never existed give the same 404, with no provider call either
+way. If the ownership lookup itself fails the answer is `503`, never a
+fall-through to the provider.
+
+**Consequence:** a batch whose ledger write failed (`logged:false` on the send
+response) has no `sends` row, so it cannot be status-read through the relay.
+Reconcile that one in the MailerSend dashboard.
+
+A `hard_off` project cannot read batches; a `marketing_enabled=false` one can,
+so an already-sent batch stays reconcilable after the switch is flipped.
+
+### Rendered-size caps
+
+A 2 MB request can describe gigabytes of output — `{{a}}` repeated a thousand
+times, a 2000-character value, 500 recipients. The relay computes the exact
+rendered size **arithmetically** before building anything, and refuses with
+`413` when a single rendered email exceeds `BULK_MAX_RENDERED_EMAIL_BYTES`
+(default 512 KB; the error names the offending recipient) or the batch exceeds
+`BULK_MAX_RENDERED_TOTAL_BYTES` (default 32 MB). The size covers the three
+substituted fields (`html`, `text`, `listUnsubscribe`).
 
 ### Substitution rules
 
@@ -69,6 +96,9 @@ Tokens are `{{key}}` with `key` matching `^[a-z][a-z0-9_]{0,39}$`.
   `text` and `listUnsubscribe`.
 - Per recipient: ≤10 keys, each value ≤2000 chars, no control characters.
   Any key ending `_url` must parse as an `https:` URL.
+- `listUnsubscribe` itself (on both `/send` and `/send-bulk`) must be a string
+  of ≤990 characters with no control characters — it becomes a mail header at
+  the provider and must not be able to split one.
 
 Each recipient gets a fully rendered email object. MailerSend's own
 `personalization` is not used — that is what keeps one recipient's opt-out URL
@@ -92,13 +122,15 @@ relay sends no such header and nothing here claims otherwise. The opt-out link
 lives in the message body instead. Turning the flag on is a plan decision, not a
 code change.
 
-### Known limitation
+### Known limitations
 
-`GET /send-bulk/:bulkEmailId` authenticates the caller but does not verify that
-the batch belongs to that caller's project — the relay does not index bulk ids
-per project. A cross-project read would require guessing a 64-character provider
-id. Closing it properly needs a lookup against `sends`; out of scope for this
-slice.
+- Rate-limit buckets live in memory and are only evicted once they would have
+  refilled to capacity anyway (evicting a depleted bucket would refund it). The
+  `/send` IP and key buckets can therefore grow under heavy address churn; the
+  map is single-instance and small per entry, and no eviction policy that avoids
+  the refund is in this slice.
+- A batch whose ledger write failed has no `sends` row and so cannot be
+  status-read (see above).
 
 ## Provider
 
@@ -114,22 +146,34 @@ MailerSend is the sole provider (`src/mailersend.ts`, REST, no SDK). Brevo was r
 
 ## Rate limiting (D2)
 
-In-process token buckets, shared by both send routes for the blunt pre-auth
-checks and separate for bulk volume. Any empty bucket → `429 {error:"rate limited"}`,
+In-process token buckets. Any empty bucket → `429 {error:"rate limited"}`,
 logged. Single-instance in-memory state — correct while the relay runs as one
 container.
 
+**`/send` and the bulk routes share no tokens at all.** Each has its own
+pre-auth IP and key buckets, so a burst of bulk attempts — or a desk polling
+the status endpoint — can never rate-limit the same caller's transactional and
+auth mail.
+
 | Bucket | Keyed by | Applies to | Env (default) |
 |---|---|---|---|
-| IP | first `X-Forwarded-For` hop | `/send`, `/send-bulk` | `RATE_LIMIT_PER_MINUTE` (60), `RATE_LIMIT_BURST` (20) |
-| key | bearer-key hash, before the DB lookup | `/send`, `/send-bulk` | same as above |
-| bulk requests | bearer-key hash | `/send-bulk` only | `BULK_REQUESTS_PER_MINUTE` (10) |
-| recipient budget | project id, **weighted by recipient count** | `/send-bulk` only | `BULK_RECIPIENTS_PER_HOUR` (2000) |
+| IP | first `X-Forwarded-For` hop | `/send` only | `RATE_LIMIT_PER_MINUTE` (60), `RATE_LIMIT_BURST` (20) |
+| key | bearer-key hash, before the DB lookup | `/send` only | same as above |
+| bulk IP | first `X-Forwarded-For` hop | `/send-bulk` + status | `BULK_RATE_LIMIT_PER_MINUTE` (60), `BULK_RATE_LIMIT_BURST` (20) |
+| bulk key | bearer-key hash, before the DB lookup | `/send-bulk` + status | same as above |
+| bulk requests | bearer-key hash | `POST /send-bulk` only | `BULK_REQUESTS_PER_MINUTE` (10) |
+| recipient budget | project id, **weighted by recipient count** | `POST /send-bulk` only | `BULK_RECIPIENTS_PER_HOUR` (2000) |
 
-Bulk has its own buckets so a newsletter can never starve transactional mail.
-The recipient budget is charged only when a send is actually about to happen —
-a suppressed or refused batch spends nothing. Body cap: **2 MB** (fixed, part
-of the contract), and recipients are capped at **500 per call**.
+The recipient budget is confirmed before the rendered-size preflight and
+charged after it, so nothing a refused request never used is spent: a
+suppressed, size-refused or rate-refused batch costs zero budget. The bulk
+request limiter sits after the kill-switch, so a project whose marketing is off
+cannot burn its own allowance by retrying.
+
+Body cap: **2 MB**, enforced while reading rather than after — the stream is
+counted as it arrives and cancelled the moment it passes the cap, so a caller
+omitting `Content-Length` cannot make the relay buffer arbitrary memory.
+Recipients are capped at **500 per call**.
 
 ## Send log
 
@@ -148,13 +192,16 @@ npx tsx src/register-project.ts rnb-vault "RnB Vault" noreply@rnbvault.no "RnB V
 
 Env: `MAILERSEND_API_KEY`, `DATABASE_URL`, `PORT` (default 8080),
 `RATE_LIMIT_PER_MINUTE` (60), `RATE_LIMIT_BURST` (20),
+`BULK_RATE_LIMIT_PER_MINUTE` (60), `BULK_RATE_LIMIT_BURST` (20),
 `BULK_REQUESTS_PER_MINUTE` (10), `BULK_RECIPIENTS_PER_HOUR` (2000),
+`BULK_MAX_RENDERED_EMAIL_BYTES` (524288), `BULK_MAX_RENDERED_TOTAL_BYTES` (33554432),
+`MAILERSEND_TIMEOUT_MS` (15000 — covers headers *and* body),
 `MAILERSEND_LIST_UNSUBSCRIBE` (default off — see § List-Unsubscribe).
 
 CI (`.github/workflows/ci.yml`) runs `npm ci && npm run build && npm test` on
 Node 22 for every PR and every push to `main`, with no `DATABASE_URL` and no
 `MAILERSEND_API_KEY` — a green run proves the suite reaches neither Postgres
-nor the provider.
+nor the provider. Actions are pinned to commit SHAs, not mutable tags.
 
 Deploy: Coolify → Dockerfile app → domain `mail.echoalgoridata.no` (TLS via Traefik). Admin ops (register/toggle) run via SSH/Tailscale only — no public admin surface.
 
