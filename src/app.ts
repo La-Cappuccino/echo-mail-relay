@@ -56,6 +56,9 @@ const CONTROL_CHAR_RE = /[\u0000-\u001F\u007F]/;
 export const MAX_BULK_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_BULK_RECIPIENTS = 500;
 const MAX_SUBJECT_LENGTH = 200;
+// A List-Unsubscribe value becomes a mail header at the provider, so it must
+// never be able to split one. 990 is the RFC 5322 line limit less CRLF.
+const MAX_LIST_UNSUBSCRIBE_LENGTH = 990;
 // A provider id is an opaque token; anything else must never reach a URL.
 const BULK_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
@@ -85,6 +88,16 @@ function defaultRecipientLimiter(): RateLimiter {
 // --- pure helpers, shared by /send and /send-bulk ---
 // These exist so the bulk routes reuse /send's exact auth arithmetic. /send
 // still performs its checks in its original order; only the arithmetic moved.
+
+/** Why this listUnsubscribe value is unacceptable, or null if it is fine. */
+function listUnsubscribeProblem(value: unknown): string | null {
+  if (typeof value !== 'string') return 'listUnsubscribe must be a string';
+  if (value.length > MAX_LIST_UNSUBSCRIBE_LENGTH) {
+    return `listUnsubscribe exceeds ${MAX_LIST_UNSUBSCRIBE_LENGTH} characters`;
+  }
+  if (CONTROL_CHAR_RE.test(value)) return 'listUnsubscribe contains a control character';
+  return null;
+}
 
 /** The first X-Forwarded-For hop, or 'unknown' when the header is absent. */
 export function firstForwardedHop(header: string | undefined): string {
@@ -229,6 +242,12 @@ export function createApp(deps: AppDeps): Hono {
     }
     if (!subject) return c.json({ error: 'missing subject' }, 400);
     if (!html) return c.json({ error: 'missing html (or template)' }, 400);
+    // Optional field added for the bulk work — absent, /send behaves exactly
+    // as it always has; present, it is validated before it can become a header.
+    if (body.listUnsubscribe !== undefined) {
+      const problem = listUnsubscribeProblem(body.listUnsubscribe);
+      if (problem) return c.json({ error: problem }, 400);
+    }
 
     // --- tiered kill-switch (SPEC D4) ---
     // hard_off blocks everything (decommissioned project).
@@ -576,11 +595,10 @@ function validateBulkBody(parsed: unknown): { value: BulkPayload } | { error: st
     return { error: 'replyTo must be an email address' };
   }
   if (body.listUnsubscribe !== undefined) {
-    if (typeof body.listUnsubscribe !== 'string') return { error: 'listUnsubscribe must be a string' };
-    // It becomes a mail header at the provider; a bare CR/LF would split it.
-    if (CONTROL_CHAR_RE.test(body.listUnsubscribe)) {
-      return { error: 'listUnsubscribe contains a control character' };
-    }
+    // Same rule as /send: it becomes a mail header at the provider, and a bare
+    // CR/LF would split it. Substituted values are checked separately.
+    const problem = listUnsubscribeProblem(body.listUnsubscribe);
+    if (problem) return { error: problem };
   }
 
   const list = body.recipients;

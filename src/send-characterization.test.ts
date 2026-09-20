@@ -394,3 +394,54 @@ test('/health: {ok:true} when the DB answers, 503 {ok:false,db:"unreachable"} wh
   assert.equal(downRes.status, 503);
   assert.deepEqual(await downRes.json(), { ok: false, db: 'unreachable' });
 });
+
+// --- listUnsubscribe: a NEW optional field on /send, not legacy behaviour ---
+// Everything above pins what /send already did. These cover the field added
+// for the bulk work: absent behaves exactly as before, present is validated.
+
+test('listUnsubscribe absent → the forwarded input is unchanged (no stray key)', async () => {
+  const { app, delivered } = makeHarness();
+  await send(app, KEYS.normal, BASE);
+  assert.equal('listUnsubscribe' in delivered[0], false);
+});
+
+test('a valid listUnsubscribe is forwarded to the provider layer', async () => {
+  const { app, delivered } = makeHarness();
+  const value = '<https://example.com/u/abc>, <mailto:unsubscribe@example.com>';
+  const res = await send(app, KEYS.normal, { ...BASE, listUnsubscribe: value });
+  assert.equal(res.status, 200);
+  assert.equal(delivered[0].listUnsubscribe, value);
+});
+
+test('a listUnsubscribe carrying CR/LF is rejected — it would split the header', async () => {
+  const { app, delivered } = makeHarness();
+  for (const bad of [
+    '<https://example.com/u>\r\nBcc: x@example.com',
+    '<https://example.com/u>\nX-Injected: 1',
+    'a\u0000b',
+    'a\u007Fb',
+  ]) {
+    const res = await send(app, KEYS.normal, { ...BASE, listUnsubscribe: bad });
+    assert.equal(res.status, 400, JSON.stringify(bad));
+    assert.match((await res.json()).error, /listUnsubscribe/);
+  }
+  assert.equal(delivered.length, 0);
+});
+
+test('listUnsubscribe must be a string and is capped at 990 characters', async () => {
+  const { app } = makeHarness();
+  const tooLong = `<https://example.com/${'x'.repeat(990)}>`;
+  assert.equal((await send(app, KEYS.normal, { ...BASE, listUnsubscribe: 42 })).status, 400);
+  assert.equal((await send(app, KEYS.normal, { ...BASE, listUnsubscribe: tooLong })).status, 400);
+  assert.equal(
+    (await send(app, KEYS.normal, { ...BASE, listUnsubscribe: 'y'.repeat(990) })).status,
+    200,
+  );
+});
+
+test('listUnsubscribe is validated before the kill-switch, like the other payload checks', async () => {
+  const { app, logged } = makeHarness();
+  const res = await send(app, KEYS.hardOff, { ...BASE, listUnsubscribe: 'a\rb' });
+  assert.equal(res.status, 400);
+  assert.equal(logged.length, 0);
+});
