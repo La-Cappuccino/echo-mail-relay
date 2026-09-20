@@ -43,7 +43,7 @@ const CONTROL_CHAR_RE = /[\u0000-\u001F\u007F]/;
 
 // /send-bulk limits (SPEC §3). The body cap is a constant, not an env var —
 // it is part of the contract the app builds against.
-const MAX_BULK_BODY_BYTES = 2 * 1024 * 1024;
+export const MAX_BULK_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_BULK_RECIPIENTS = 500;
 const MAX_SUBJECT_LENGTH = 200;
 // A provider id is an opaque token; anything else must never reach a URL.
@@ -96,6 +96,37 @@ export function keyHashMatches(storedHex: string, givenHex: string): boolean {
   const a = Buffer.from(storedHex, 'hex');
   const b = Buffer.from(givenHex, 'hex');
   return a.length === b.length && timingSafeEqual(a, b);
+}
+
+/**
+ * Read at most `max` bytes of the request body, then stop.
+ *
+ * Measuring after `req.text()` would buffer the whole stream first, so a
+ * caller omitting Content-Length could make the relay hold an arbitrary
+ * amount of memory before being told the body is too large. This counts as
+ * it reads and cancels the source the moment the cap is passed. Chunks are
+ * concatenated before decoding, so a multi-byte character split across a
+ * chunk boundary survives.
+ */
+export async function readBoundedBody(
+  stream: ReadableStream<Uint8Array> | null,
+  max: number,
+): Promise<{ body: string } | { tooLarge: true }> {
+  if (!stream) return { body: '' };
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > max) {
+      await reader.cancel();
+      return { tooLarge: true };
+    }
+    chunks.push(value);
+  }
+  return { body: Buffer.concat(chunks).toString('utf8') };
 }
 
 export function createApp(deps: AppDeps): Hono {
@@ -319,16 +350,16 @@ export function createApp(deps: AppDeps): Hono {
     }
 
     // --- body size cap (SPEC §3) ---
+    // Cheap rejection first when the caller declares its size, then a bounded
+    // read that stops at the cap whether or not it declared one.
     const declared = Number(c.req.header('content-length') ?? 0);
     if (declared > MAX_BULK_BODY_BYTES) return c.json({ error: 'body too large' }, 413);
-    const raw = await c.req.text();
-    if (Buffer.byteLength(raw) > MAX_BULK_BODY_BYTES) {
-      return c.json({ error: 'body too large' }, 413);
-    }
+    const read = await readBoundedBody(c.req.raw.body, MAX_BULK_BODY_BYTES);
+    if ('tooLarge' in read) return c.json({ error: 'body too large' }, 413);
 
     let parsed: unknown;
     try {
-      parsed = JSON.parse(raw);
+      parsed = JSON.parse(read.body);
     } catch {
       return c.json({ error: 'invalid JSON body' }, 400);
     }

@@ -7,7 +7,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { createApp, type AppDeps } from './app.js';
+import { createApp, MAX_BULK_BODY_BYTES, type AppDeps } from './app.js';
 import type { Project, SendLogEntry } from './db.js';
 import { MailerSendError, type BulkStatus, type MailerSendInput } from './mailersend.js';
 import { RateLimiter } from './ratelimit.js';
@@ -754,4 +754,98 @@ test('draining /send leaves bulk untouched', async () => {
   assert.equal((await postSend(app, KEYS.normal, ip)).status, 429);
 
   assert.equal((await postBulk(app, KEYS.normal, BASE, ip)).status, 200);
+});
+
+// --- the 2 MB cap must bound buffering, not just measure it (Codex #2) ---
+
+const CHUNK_BYTES = 64 * 1024;
+
+/** A body with no content-length that can supply far more than the cap. */
+function chunkedBody(maxChunks: number) {
+  const state = { pulled: 0 };
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      state.pulled += 1;
+      if (state.pulled > maxChunks) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(new Uint8Array(CHUNK_BYTES).fill(0x78)); // 'x'
+    },
+  });
+  return { stream, state };
+}
+
+test('a chunked body with no content-length is cut off the moment it passes the cap', async () => {
+  const { app, batches } = makeHarness();
+  const available = 200; // 12.8 MB if fully drained
+  const { stream, state } = chunkedBody(available);
+
+  const res = await app.request('/send-bulk', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${KEYS.normal}`, 'content-type': 'application/json' },
+    body: stream,
+    duplex: 'half',
+  } as RequestInit & { duplex: string });
+
+  assert.equal(res.status, 413);
+  assert.match((await res.json()).error, /too large/);
+  assert.equal(batches.length, 0);
+  // The reader stopped early instead of buffering the whole source: the cap is
+  // 2 MB, so it should have pulled ~33 of the 200 available chunks.
+  assert.ok(state.pulled < available, `reader drained the whole source (pulled=${state.pulled})`);
+  assert.ok(
+    state.pulled <= MAX_BULK_BODY_BYTES / CHUNK_BYTES + 2,
+    `reader over-buffered (pulled=${state.pulled})`,
+  );
+});
+
+test('a chunked body under the cap is read in full', async () => {
+  const { app } = makeHarness();
+  const payload = JSON.stringify(BASE);
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      // deliberately split mid-document so reassembly is exercised
+      const bytes = Buffer.from(payload, 'utf8');
+      controller.enqueue(new Uint8Array(bytes.subarray(0, 10)));
+      controller.enqueue(new Uint8Array(bytes.subarray(10)));
+      controller.close();
+    },
+  });
+  const res = await app.request('/send-bulk', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${KEYS.normal}`, 'content-type': 'application/json' },
+    body: stream,
+    duplex: 'half',
+  } as RequestInit & { duplex: string });
+  assert.equal(res.status, 200);
+});
+
+test('a multi-byte character split across chunks survives reassembly', async () => {
+  const { app, batches } = makeHarness();
+  const payload = Buffer.from(
+    JSON.stringify({
+      ...BASE,
+      text: undefined,
+      html: '<p>Blåbærsyltetøy — æøå 🎧</p>{{unsubscribe_url}}',
+    }),
+    'utf8',
+  );
+  // split at a byte that lands inside a multi-byte sequence
+  const cut = payload.indexOf(Buffer.from('🎧', 'utf8')) + 2;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new Uint8Array(payload.subarray(0, cut)));
+      controller.enqueue(new Uint8Array(payload.subarray(cut)));
+      controller.close();
+    },
+  });
+  const res = await app.request('/send-bulk', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${KEYS.normal}`, 'content-type': 'application/json' },
+    body: stream,
+    duplex: 'half',
+  } as RequestInit & { duplex: string });
+  assert.equal(res.status, 200);
+  assert.match(batches[0][0].html, /Blåbærsyltetøy — æøå 🎧/);
 });
