@@ -53,6 +53,12 @@ export interface ValidatedSubstitutions {
 export interface RenderedSizes {
   perEmail: number[];
   total: number;
+  /**
+   * Expanded byte length of `listUnsubscribe` per recipient, when the template
+   * has one. Kept separate because that field becomes a mail header with its
+   * own much tighter limit — a template well inside it can still expand past.
+   */
+  listUnsubscribePerEmail?: number[];
 }
 
 const HTML_ESCAPES: Record<string, string> = {
@@ -224,15 +230,22 @@ export function renderedSizes(
     templates.listUnsubscribe !== undefined ? fieldShape(templates.listUnsubscribe) : undefined;
 
   let total = 0;
+  const listUnsubscribePerEmail: number[] = [];
   const perEmail = validated.bags.map((bag) => {
-    const size =
-      fieldSize(html, bag, true) +
-      (text ? fieldSize(text, bag, false) : 0) +
-      (listUnsubscribe ? fieldSize(listUnsubscribe, bag, false) : 0);
+    let size = fieldSize(html, bag, true) + (text ? fieldSize(text, bag, false) : 0);
+    if (listUnsubscribe) {
+      const headerSize = fieldSize(listUnsubscribe, bag, false);
+      listUnsubscribePerEmail.push(headerSize);
+      size += headerSize;
+    }
     total += size;
     return size;
   });
-  return { perEmail, total };
+  return {
+    perEmail,
+    total,
+    ...(listUnsubscribe ? { listUnsubscribePerEmail } : {}),
+  };
 }
 
 /** One pass over the original template; substituted text is never re-scanned. */

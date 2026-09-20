@@ -441,17 +441,16 @@ export function createApp(deps: AppDeps): Hono {
       return c.json({ ok: true, suppressed: true, reason: suppressReason });
     }
 
-    // --- rate limit: bulk requests per key, separate from /send's buckets ---
-    if (!bulkLimiter.take(`key:${hash}`)) {
+    // --- volume protection ---
+    // Both allowances are CONFIRMED here and CHARGED after the size preflight,
+    // so a request the preflight refuses spends neither. Nothing awaits between
+    // the confirmation and the charge, so nothing else can take them meanwhile.
+    const bulkKey = `key:${hash}`;
+    const budgetKey = `project:${project.id}`;
+    if (!bulkLimiter.canTake(bulkKey)) {
       console.warn(`[relay] bulk rate limited key=${hash.slice(0, 8)}…`);
       return c.json({ error: 'rate limited' }, 429);
     }
-
-    // --- volume protection: recipients per project, not requests per key ---
-    // Confirmed here but charged further down, so that a request refused by
-    // the size preflight does not eat budget it never used. Nothing awaits in
-    // between, so no other request can spend the budget we just confirmed.
-    const budgetKey = `project:${project.id}`;
     if (!recipientLimiter.canTake(budgetKey, recipients.length)) {
       console.warn(`[relay] recipient budget exhausted project=${project.id} n=${recipients.length}`);
       return c.json({ error: 'recipient budget exhausted' }, 429);
@@ -461,6 +460,22 @@ export function createApp(deps: AppDeps): Hono {
     // A 2 MB request can describe gigabytes of output ({{a}} a thousand times
     // over, a 2000-char value, 500 recipients). Refuse it before building it.
     const sizes = renderedSizes(templates, substitutions);
+
+    // listUnsubscribe is capped as a template further up, but substitution can
+    // expand a five-character token into a 2000-character header value, so the
+    // EXPANDED length is what has to satisfy the limit.
+    const overLongHeader = (sizes.listUnsubscribePerEmail ?? []).findIndex(
+      (n) => n > MAX_LIST_UNSUBSCRIBE_LENGTH,
+    );
+    if (overLongHeader >= 0) {
+      return c.json(
+        {
+          error: `listUnsubscribe exceeds ${MAX_LIST_UNSUBSCRIBE_LENGTH} characters after substitution (recipient ${overLongHeader + 1})`,
+        },
+        400,
+      );
+    }
+
     const oversized = sizes.perEmail.findIndex((n) => n > maxRenderedEmailBytes);
     if (oversized >= 0) {
       return c.json(
@@ -474,9 +489,13 @@ export function createApp(deps: AppDeps): Hono {
       return c.json({ error: `rendered batch exceeds ${maxRenderedTotalBytes} bytes` }, 413);
     }
 
-    if (!recipientLimiter.take(budgetKey, recipients.length)) {
-      console.warn(`[relay] recipient budget exhausted project=${project.id} n=${recipients.length}`);
-      return c.json({ error: 'recipient budget exhausted' }, 429);
+    // Charge both, synchronously, immediately before rendering. Both were
+    // confirmed above with no await in between, so this cannot fail — the
+    // guard is here so that a future edit introducing an await gets a 429
+    // rather than a silently unmetered send.
+    if (!bulkLimiter.take(bulkKey) || !recipientLimiter.take(budgetKey, recipients.length)) {
+      console.warn(`[relay] bulk allowance vanished between check and charge project=${project.id}`);
+      return c.json({ error: 'rate limited' }, 429);
     }
 
     const rendered = renderBodies(templates, substitutions);

@@ -1151,3 +1151,119 @@ test('a valid numeric env is honoured exactly, and logs nothing', async () => {
   }
   assert.deepEqual(logs, []);
 });
+
+// --- a size refusal must not spend a bulk request slot (round-2 #2) ---
+
+const OVERSIZED = {
+  tier: 'marketing',
+  subject: 'Big',
+  html: '{{note}}',
+  recipients: [{ to: 'a@example.com', substitutions: { note: 'y'.repeat(300) } }],
+};
+
+test('a 413 spends no bulk request slot — the next valid request still goes through', async () => {
+  const { app } = withEnv({ BULK_MAX_RENDERED_EMAIL_BYTES: '200' }, () =>
+    harnessWithRenderSpy({ bulkLimiter: new RateLimiter({ capacity: 1, refillPerSec: 0 }) }),
+  );
+  assert.equal((await postBulk(app, KEYS.normal, OVERSIZED)).status, 413);
+  assert.equal((await postBulk(app, KEYS.normal, BASE)).status, 200);
+});
+
+test('a batch-total 413 spends no bulk request slot either', async () => {
+  const { app } = withEnv({ BULK_MAX_RENDERED_TOTAL_BYTES: '100' }, () =>
+    harnessWithRenderSpy({ bulkLimiter: new RateLimiter({ capacity: 1, refillPerSec: 0 }) }),
+  );
+  assert.equal((await postBulk(app, KEYS.normal, BASE)).status, 413);
+  const { app: fresh } = harnessWithRenderSpy({
+    bulkLimiter: new RateLimiter({ capacity: 1, refillPerSec: 0 }),
+  });
+  assert.equal((await postBulk(fresh, KEYS.normal, BASE)).status, 200);
+});
+
+test('a budget refusal spends no bulk request slot', async () => {
+  const { app } = harnessWithRenderSpy({
+    bulkLimiter: new RateLimiter({ capacity: 1, refillPerSec: 0 }),
+    recipientLimiter: new RateLimiter({ capacity: 1, refillPerSec: 0 }),
+  });
+  assert.equal((await postBulk(app, KEYS.normal, BASE)).status, 429); // needs 3, has 1
+  assert.equal((await postBulk(app, KEYS.normal, { ...BASE, recipients: recipients(1) })).status, 200);
+});
+
+test('a successful send still spends exactly one request slot and its recipients', async () => {
+  const { app } = harnessWithRenderSpy({
+    bulkLimiter: new RateLimiter({ capacity: 2, refillPerSec: 0 }),
+    recipientLimiter: new RateLimiter({ capacity: 6, refillPerSec: 0 }),
+  });
+  assert.equal((await postBulk(app, KEYS.normal, BASE)).status, 200);
+  assert.equal((await postBulk(app, KEYS.normal, BASE)).status, 200);
+  assert.equal((await postBulk(app, KEYS.normal, { ...BASE, recipients: recipients(1) })).status, 429);
+});
+
+// --- substitution must not smuggle past the 990-char header cap (round-2 #3) ---
+
+test('an expanded listUnsubscribe over 990 is refused, naming the recipient', async () => {
+  const { app, batches, renderCalls } = harnessWithRenderSpy();
+  const res = await postBulk(app, KEYS.normal, {
+    tier: 'marketing',
+    subject: 'Header',
+    html: '<p>hi</p>',
+    listUnsubscribe: '{{a}}',
+    recipients: [
+      { to: 'a@example.com', substitutions: { a: 'x'.repeat(10) } },
+      { to: 'b@example.com', substitutions: { a: 'x'.repeat(2000) } },
+    ],
+  });
+  assert.equal(res.status, 400);
+  const { error } = await res.json();
+  assert.match(error, /listUnsubscribe/);
+  assert.match(error, /recipient 2/);
+  assert.equal(batches.length, 0);
+  assert.equal(renderCalls.length, 0);
+});
+
+test('an expanded listUnsubscribe of exactly 990 passes; 991 does not', async () => {
+  const body = (n: number) => ({
+    tier: 'marketing',
+    subject: 'Header',
+    html: '<p>hi</p>',
+    listUnsubscribe: '{{a}}',
+    recipients: [{ to: 'a@example.com', substitutions: { a: 'x'.repeat(n) } }],
+  });
+  const { app, batches } = harnessWithRenderSpy();
+  assert.equal((await postBulk(app, KEYS.normal, body(990))).status, 200);
+  assert.equal(batches[0][0].listUnsubscribe?.length, 990);
+  assert.equal((await postBulk(app, KEYS.normal, body(991))).status, 400);
+});
+
+test('the expanded-header refusal spends neither a request slot nor budget', async () => {
+  const { app } = harnessWithRenderSpy({
+    bulkLimiter: new RateLimiter({ capacity: 1, refillPerSec: 0 }),
+    recipientLimiter: new RateLimiter({ capacity: 3, refillPerSec: 0 }),
+  });
+  const res = await postBulk(app, KEYS.normal, {
+    tier: 'marketing',
+    subject: 'Header',
+    html: '<p>hi</p>',
+    listUnsubscribe: '{{a}}',
+    recipients: [{ to: 'a@example.com', substitutions: { a: 'x'.repeat(2000) } }],
+  });
+  assert.equal(res.status, 400);
+  assert.equal((await postBulk(app, KEYS.normal, BASE)).status, 200);
+});
+
+test('a multi-token listUnsubscribe is measured expanded, not as a template', async () => {
+  const { app } = harnessWithRenderSpy();
+  const res = await postBulk(app, KEYS.normal, {
+    tier: 'marketing',
+    subject: 'Header',
+    html: '<p>hi</p>',
+    listUnsubscribe: '<{{a}}>, <{{b}}>',
+    recipients: [
+      {
+        to: 'a@example.com',
+        substitutions: { a: `https://example.com/${'x'.repeat(500)}`, b: `mailto:${'y'.repeat(500)}@example.com` },
+      },
+    ],
+  });
+  assert.equal(res.status, 400);
+});
