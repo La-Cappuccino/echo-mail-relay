@@ -5,6 +5,16 @@
 // ORIGINAL templates, every token must be supplied by every recipient, and a
 // single bad value fails the whole call before anything is sent.
 //
+// The work is split in three deliberately separate steps, because rendering is
+// the expensive one and must be the LAST thing that happens:
+//   validateSubstitutions — checks tokens, keys and values. Allocates nothing
+//                           proportional to the output.
+//   renderedSizes         — the exact rendered byte size, by arithmetic, so an
+//                           amplifying payload ({{a}}×1000 with a 2000-char
+//                           value, ×500 recipients) is refused BEFORE it is
+//                           built.
+//   renderRecipients      — actually materialises the bodies.
+//
 // MailerSend's own `personalization` is not used — the relay renders each
 // email fully and hands the provider finished bodies.
 
@@ -34,6 +44,17 @@ export interface RenderedBodies {
   listUnsubscribe?: string;
 }
 
+/** The product of validation: safe to size, safe to render, nothing rendered yet. */
+export interface ValidatedSubstitutions {
+  tokens: string[];
+  bags: Record<string, string>[];
+}
+
+export interface RenderedSizes {
+  perEmail: number[];
+  total: number;
+}
+
 const HTML_ESCAPES: Record<string, string> = {
   '&': '&amp;',
   '<': '&lt;',
@@ -44,6 +65,31 @@ const HTML_ESCAPES: Record<string, string> = {
 
 function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (ch) => HTML_ESCAPES[ch]);
+}
+
+/** Byte length the value would occupy once HTML-escaped — without escaping it. */
+function escapedByteLength(value: string): number {
+  let extra = 0;
+  for (let i = 0; i < value.length; i += 1) {
+    switch (value.charCodeAt(i)) {
+      case 38: // & -> &amp;
+        extra += 4;
+        break;
+      case 60: // < -> &lt;
+      case 62: // > -> &gt;
+        extra += 3;
+        break;
+      case 34: // " -> &quot;
+        extra += 5;
+        break;
+      case 39: // ' -> &#39;
+        extra += 4;
+        break;
+      default:
+        break;
+    }
+  }
+  return Buffer.byteLength(value) + extra;
 }
 
 function templateParts(templates: SubstitutionTemplates): string[] {
@@ -115,24 +161,16 @@ function isHttpsUrl(value: string): boolean {
   }
 }
 
-/** One pass over the original template; substituted text is never re-scanned. */
-function substitute(template: string, values: Record<string, string>, escape: boolean): string {
-  return template.replace(TOKEN_SCAN_RE, (_match, key: string) =>
-    escape ? escapeHtml(values[key]) : values[key],
-  );
-}
-
 /**
- * Renders one set of bodies per recipient, or throws — never partially. The
- * caller can therefore treat a throw as "nothing was sent, and nothing will be".
+ * Validates the templates and every recipient's values, or throws — never
+ * partially. A throw therefore means "nothing was sent, and nothing will be".
+ * Nothing is rendered here.
  */
-export function renderRecipients(
+export function validateSubstitutions(
   templates: SubstitutionTemplates,
   recipients: RecipientSubstitutions[],
-): RenderedBodies[] {
+): ValidatedSubstitutions {
   const tokens = collectTokens(templates);
-
-  // Validate every recipient before rendering any of them.
   const bags = recipients.map((recipient, index) => {
     const position = index + 1;
     const bag = validateBag(recipient?.substitutions, position);
@@ -143,8 +181,73 @@ export function renderRecipients(
     }
     return bag;
   });
+  return { tokens, bags };
+}
 
-  return bags.map((bag) => ({
+/** How many times each token occurs in a field, plus the field's own byte size. */
+interface FieldShape {
+  baseBytes: number;
+  occurrences: Map<string, number>;
+}
+
+function fieldShape(field: string): FieldShape {
+  const occurrences = new Map<string, number>();
+  for (const [, key] of field.matchAll(TOKEN_SCAN_RE)) {
+    occurrences.set(key, (occurrences.get(key) ?? 0) + 1);
+  }
+  return { baseBytes: Buffer.byteLength(field), occurrences };
+}
+
+function fieldSize(shape: FieldShape, bag: Record<string, string>, escape: boolean): number {
+  let size = shape.baseBytes;
+  for (const [token, count] of shape.occurrences) {
+    const value = bag[token];
+    const replacement = escape ? escapedByteLength(value) : Buffer.byteLength(value);
+    // each occurrence loses `{{token}}` and gains the replacement
+    size += count * (replacement - (token.length + 4));
+  }
+  return size;
+}
+
+/**
+ * Exact rendered size per email, by arithmetic — nothing is materialised.
+ * Covers the three substituted fields; the subject is not substituted and is
+ * already capped by the route.
+ */
+export function renderedSizes(
+  templates: SubstitutionTemplates,
+  validated: ValidatedSubstitutions,
+): RenderedSizes {
+  const html = fieldShape(templates.html);
+  const text = templates.text !== undefined ? fieldShape(templates.text) : undefined;
+  const listUnsubscribe =
+    templates.listUnsubscribe !== undefined ? fieldShape(templates.listUnsubscribe) : undefined;
+
+  let total = 0;
+  const perEmail = validated.bags.map((bag) => {
+    const size =
+      fieldSize(html, bag, true) +
+      (text ? fieldSize(text, bag, false) : 0) +
+      (listUnsubscribe ? fieldSize(listUnsubscribe, bag, false) : 0);
+    total += size;
+    return size;
+  });
+  return { perEmail, total };
+}
+
+/** One pass over the original template; substituted text is never re-scanned. */
+function substitute(template: string, values: Record<string, string>, escape: boolean): string {
+  return template.replace(TOKEN_SCAN_RE, (_match, key: string) =>
+    escape ? escapeHtml(values[key]) : values[key],
+  );
+}
+
+/** Materialises one set of bodies per recipient. Validate (and size) first. */
+export function renderRecipients(
+  templates: SubstitutionTemplates,
+  validated: ValidatedSubstitutions,
+): RenderedBodies[] {
+  return validated.bags.map((bag) => ({
     html: substitute(templates.html, bag, true),
     ...(templates.text !== undefined ? { text: substitute(templates.text, bag, false) } : {}),
     ...(templates.listUnsubscribe !== undefined

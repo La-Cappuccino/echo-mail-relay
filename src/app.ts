@@ -4,7 +4,13 @@ import type { Project, SendLogEntry } from './db.js';
 import { MailerSendError, type BulkStatus, type MailerSendInput } from './mailersend.js';
 import { renderTemplate, TemplateError } from './templates/index.js';
 import { RateLimiter } from './ratelimit.js';
-import { renderRecipients, SubstitutionError } from './substitute.js';
+import {
+  renderedSizes,
+  renderRecipients,
+  SubstitutionError,
+  validateSubstitutions,
+  type SubstitutionTemplates,
+} from './substitute.js';
 
 export interface AppDeps {
   findProjectByKeyHash(hash: string): Promise<Project | null>;
@@ -24,6 +30,8 @@ export interface AppDeps {
   bulkKeyLimiter?: RateLimiter;
   bulkLimiter?: RateLimiter;
   recipientLimiter?: RateLimiter;
+  // Injectable only so a test can prove that a refused path never renders.
+  renderBodies?: typeof renderRecipients;
 }
 
 interface SendBody {
@@ -142,6 +150,13 @@ export function createApp(deps: AppDeps): Hono {
   const bulkKeyLimiter = deps.bulkKeyLimiter ?? defaultBulkPreAuthLimiter();
   const bulkLimiter = deps.bulkLimiter ?? defaultBulkLimiter();
   const recipientLimiter = deps.recipientLimiter ?? defaultRecipientLimiter();
+  const renderBodies = deps.renderBodies ?? renderRecipients;
+  // A 2 MB request can still describe gigabytes of output, so the rendered
+  // size is capped separately from the request size.
+  const maxRenderedEmailBytes = Number(process.env.BULK_MAX_RENDERED_EMAIL_BYTES ?? 512 * 1024);
+  const maxRenderedTotalBytes = Number(
+    process.env.BULK_MAX_RENDERED_TOTAL_BYTES ?? 32 * 1024 * 1024,
+  );
 
   app.get('/health', async (c) => {
     try {
@@ -343,12 +358,6 @@ export function createApp(deps: AppDeps): Hono {
     if ('error' in auth) return auth.error;
     const { project, hash } = auth;
 
-    // --- rate limit: bulk requests per key, separate from /send's buckets ---
-    if (!bulkLimiter.take(`key:${hash}`)) {
-      console.warn(`[relay] bulk rate limited key=${hash.slice(0, 8)}…`);
-      return c.json({ error: 'rate limited' }, 429);
-    }
-
     // --- body size cap (SPEC §3) ---
     // Cheap rejection first when the caller declares its size, then a bounded
     // read that stops at the cap whether or not it declared one.
@@ -368,11 +377,18 @@ export function createApp(deps: AppDeps): Hono {
     if ('error' in validated) return c.json({ error: validated.error }, 400);
     const { subject, html, text, replyTo, listUnsubscribe, recipients } = validated.value;
 
-    // Render every recipient up front: a substitution problem anywhere fails
-    // the whole call with 400 and nothing is sent (SPEC §3).
-    let rendered;
+    // Validate every recipient's substitutions up front — a problem anywhere
+    // fails the whole call with 400 and nothing is sent (SPEC §3). This step
+    // deliberately renders NOTHING: bodies are materialised only once the
+    // request has survived the kill-switch, the budget and the size preflight.
+    const templates: SubstitutionTemplates = {
+      html,
+      ...(text !== undefined ? { text } : {}),
+      ...(listUnsubscribe !== undefined ? { listUnsubscribe } : {}),
+    };
+    let substitutions;
     try {
-      rendered = renderRecipients({ html, text, listUnsubscribe }, recipients);
+      substitutions = validateSubstitutions(templates, recipients);
     } catch (err) {
       if (err instanceof SubstitutionError) return c.json({ error: err.message }, 400);
       throw err;
@@ -396,14 +412,45 @@ export function createApp(deps: AppDeps): Hono {
       return c.json({ ok: true, suppressed: true, reason: suppressReason });
     }
 
+    // --- rate limit: bulk requests per key, separate from /send's buckets ---
+    if (!bulkLimiter.take(`key:${hash}`)) {
+      console.warn(`[relay] bulk rate limited key=${hash.slice(0, 8)}…`);
+      return c.json({ error: 'rate limited' }, 429);
+    }
+
     // --- volume protection: recipients per project, not requests per key ---
-    // Charged only once the send is actually going to happen, so a refused or
-    // suppressed batch never eats budget it did not use.
-    if (!recipientLimiter.take(`project:${project.id}`, recipients.length)) {
+    // Confirmed here but charged further down, so that a request refused by
+    // the size preflight does not eat budget it never used. Nothing awaits in
+    // between, so no other request can spend the budget we just confirmed.
+    const budgetKey = `project:${project.id}`;
+    if (!recipientLimiter.canTake(budgetKey, recipients.length)) {
       console.warn(`[relay] recipient budget exhausted project=${project.id} n=${recipients.length}`);
       return c.json({ error: 'recipient budget exhausted' }, 429);
     }
 
+    // --- rendered size preflight: arithmetic, nothing materialised ---
+    // A 2 MB request can describe gigabytes of output ({{a}} a thousand times
+    // over, a 2000-char value, 500 recipients). Refuse it before building it.
+    const sizes = renderedSizes(templates, substitutions);
+    const oversized = sizes.perEmail.findIndex((n) => n > maxRenderedEmailBytes);
+    if (oversized >= 0) {
+      return c.json(
+        {
+          error: `rendered email exceeds ${maxRenderedEmailBytes} bytes (recipient ${oversized + 1})`,
+        },
+        413,
+      );
+    }
+    if (sizes.total > maxRenderedTotalBytes) {
+      return c.json({ error: `rendered batch exceeds ${maxRenderedTotalBytes} bytes` }, 413);
+    }
+
+    if (!recipientLimiter.take(budgetKey, recipients.length)) {
+      console.warn(`[relay] recipient budget exhausted project=${project.id} n=${recipients.length}`);
+      return c.json({ error: 'recipient budget exhausted' }, 429);
+    }
+
+    const rendered = renderBodies(templates, substitutions);
     const inputs: MailerSendInput[] = rendered.map((bodies, i) => ({
       fromEmail: project.from_email,
       fromName: project.from_name,

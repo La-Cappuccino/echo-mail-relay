@@ -11,6 +11,7 @@ import { createApp, MAX_BULK_BODY_BYTES, type AppDeps } from './app.js';
 import type { Project, SendLogEntry } from './db.js';
 import { MailerSendError, type BulkStatus, type MailerSendInput } from './mailersend.js';
 import { RateLimiter } from './ratelimit.js';
+import { renderRecipients } from './substitute.js';
 
 const KEYS = {
   normal: 'b-normal-project',
@@ -848,4 +849,141 @@ test('a multi-byte character split across chunks survives reassembly', async () 
   } as RequestInit & { duplex: string });
   assert.equal(res.status, 200);
   assert.match(batches[0][0].html, /Blåbærsyltetøy — æøå 🎧/);
+});
+
+// --- substitution amplification (Codex #3) ---
+
+/** A harness that counts how many times bodies were actually materialised. */
+function harnessWithRenderSpy(overrides: Partial<AppDeps> = {}) {
+  const calls: number[] = [];
+  const h = makeHarness({
+    renderBodies: (templates, validated) => {
+      calls.push(validated.bags.length);
+      return renderRecipients(templates, validated);
+    },
+    ...overrides,
+  });
+  return { ...h, renderCalls: calls };
+}
+
+function withEnv<T>(vars: Record<string, string | undefined>, fn: () => T): T {
+  const previous = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
+  const apply = (values: Record<string, string | undefined>) => {
+    for (const [key, value] of Object.entries(values)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  };
+  apply(vars);
+  try {
+    return fn();
+  } finally {
+    apply(previous);
+  }
+}
+
+/** ~1 MB of JSON describing ~1 GB of rendered output. */
+const AMPLIFYING = {
+  tier: 'marketing',
+  subject: 'Boom',
+  html: '{{unsubscribe_url}}'.repeat(1000),
+  recipients: Array.from({ length: 500 }, (_, i) => ({
+    to: `r${i + 1}@example.com`,
+    substitutions: { unsubscribe_url: `https://example.com/${'x'.repeat(1960)}/${i + 1}` },
+  })),
+};
+
+test('an amplifying payload is refused by size before a single body is built', async () => {
+  const { app, batches, renderCalls } = harnessWithRenderSpy();
+  const res = await postBulk(app, KEYS.normal, AMPLIFYING);
+  assert.equal(res.status, 413);
+  assert.match((await res.json()).error, /rendered email exceeds/);
+  assert.equal(renderCalls.length, 0, 'nothing may be rendered');
+  assert.equal(batches.length, 0);
+});
+
+test('the per-email cap names the offending recipient', async () => {
+  const { app } = withEnv({ BULK_MAX_RENDERED_EMAIL_BYTES: '200' }, () => harnessWithRenderSpy());
+  const res = await postBulk(app, KEYS.normal, {
+    tier: 'marketing',
+    subject: 'Mixed',
+    html: '{{note}}',
+    recipients: [
+      { to: 'a@example.com', substitutions: { note: 'short' } },
+      { to: 'b@example.com', substitutions: { note: 'y'.repeat(300) } },
+    ],
+  });
+  assert.equal(res.status, 413);
+  assert.match((await res.json()).error, /recipient 2/);
+});
+
+test('the batch total cap refuses a batch of individually-acceptable emails', async () => {
+  const { app, renderCalls } = withEnv(
+    { BULK_MAX_RENDERED_EMAIL_BYTES: '4096', BULK_MAX_RENDERED_TOTAL_BYTES: '5000' },
+    () => harnessWithRenderSpy(),
+  );
+  const res = await postBulk(app, KEYS.normal, {
+    tier: 'marketing',
+    subject: 'Sum',
+    html: '{{note}}',
+    recipients: Array.from({ length: 10 }, (_, i) => ({
+      to: `r${i + 1}@example.com`,
+      substitutions: { note: 'z'.repeat(1000) },
+    })),
+  });
+  assert.equal(res.status, 413);
+  assert.match((await res.json()).error, /rendered batch exceeds/);
+  assert.equal(renderCalls.length, 0);
+});
+
+test('a size-refused request spends NO recipient budget', async () => {
+  const { app } = withEnv({ BULK_MAX_RENDERED_EMAIL_BYTES: '200' }, () =>
+    harnessWithRenderSpy({ recipientLimiter: new RateLimiter({ capacity: 5, refillPerSec: 0 }) }),
+  );
+  const big = {
+    tier: 'marketing',
+    subject: 'Big',
+    html: '{{note}}',
+    recipients: [{ to: 'a@example.com', substitutions: { note: 'y'.repeat(300) } }],
+  };
+  assert.equal((await postBulk(app, KEYS.normal, big)).status, 413);
+  // all 5 are still available
+  assert.equal((await postBulk(app, KEYS.normal, { ...BASE, recipients: recipients(5) })).status, 200);
+});
+
+test('a suppressed request never materialises bodies', async () => {
+  const { app, renderCalls } = harnessWithRenderSpy();
+  assert.equal((await postBulk(app, KEYS.marketingOff, BASE)).status, 200);
+  assert.equal((await postBulk(app, KEYS.hardOff, BASE)).status, 403);
+  assert.equal(renderCalls.length, 0);
+});
+
+test('a budget-refused request never materialises bodies', async () => {
+  const { app, renderCalls } = harnessWithRenderSpy({
+    recipientLimiter: new RateLimiter({ capacity: 2, refillPerSec: 0 }),
+  });
+  assert.equal((await postBulk(app, KEYS.normal, BASE)).status, 429);
+  assert.equal(renderCalls.length, 0);
+});
+
+test('a request that survives every gate renders exactly once, for every recipient', async () => {
+  const { app, renderCalls } = harnessWithRenderSpy();
+  assert.equal((await postBulk(app, KEYS.normal, BASE)).status, 200);
+  assert.deepEqual(renderCalls, [3]);
+});
+
+test('a suppressed request spends no bulk request slot either', async () => {
+  // The request limiter sits after the kill-switch, so a project whose
+  // marketing is off cannot burn its own send allowance by retrying.
+  const { app } = makeHarness({ bulkLimiter: new RateLimiter({ capacity: 1, refillPerSec: 0 }) });
+  assert.equal((await postBulk(app, KEYS.marketingOff, BASE)).status, 200);
+  assert.equal((await postBulk(app, KEYS.normal, BASE)).status, 200);
+  assert.equal((await postBulk(app, KEYS.normal, BASE)).status, 429);
+});
+
+test('a payload refused for size is refused for size, not mislabelled as a body-cap 413', async () => {
+  const { app } = harnessWithRenderSpy();
+  const res = await postBulk(app, KEYS.normal, AMPLIFYING);
+  assert.equal(res.status, 413);
+  assert.equal((await res.json()).error.includes('body too large'), false);
 });
