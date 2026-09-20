@@ -17,9 +17,12 @@
 //              or an accept we cannot pin to a bulk id)
 // Never guess: an id we did not read is `unknown`, not an empty string.
 
+import { positiveInt } from './env.js';
+
 const MAILERSEND_URL = 'https://api.mailersend.com/v1/email';
 const MAILERSEND_BULK_URL = 'https://api.mailersend.com/v1/bulk-email';
 const BULK_TIMEOUT_MS = 15_000;
+const MAX_TIMEOUT_MS = 120_000;
 
 export interface MailerSendInput {
   fromEmail: string;
@@ -55,9 +58,14 @@ export interface BulkStatus {
   raw: unknown;
 }
 
-/** Overridable only so tests need not wait out the real 15 s deadline. */
-function bulkTimeoutMs(): number {
-  return Number(process.env.MAILERSEND_TIMEOUT_MS ?? BULK_TIMEOUT_MS);
+/**
+ * Overridable only so tests need not wait out the real 15 s deadline.
+ * Validated: a NaN, empty, zero or negative value would abort every response
+ * within a millisecond or two, turning every send into an `unknown` outcome —
+ * the worst possible failure mode, since `unknown` means "a human must check".
+ */
+export function bulkTimeoutMs(): number {
+  return positiveInt('MAILERSEND_TIMEOUT_MS', BULK_TIMEOUT_MS, { max: MAX_TIMEOUT_MS });
 }
 
 function listUnsubscribeEnabled(): boolean {

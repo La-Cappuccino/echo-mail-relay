@@ -4,6 +4,7 @@ import type { Project, SendLogEntry } from './db.js';
 import { MailerSendError, type BulkStatus, type MailerSendInput } from './mailersend.js';
 import { renderTemplate, TemplateError } from './templates/index.js';
 import { RateLimiter } from './ratelimit.js';
+import { positiveInt } from './env.js';
 import {
   renderedSizes,
   renderRecipients,
@@ -62,26 +63,31 @@ const MAX_LIST_UNSUBSCRIBE_LENGTH = 990;
 // A provider id is an opaque token; anything else must never reach a URL.
 const BULK_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
+// Sane ceilings, so a fat-fingered value cannot disable what it configures.
+const MAX_RATE = 1_000_000; // calls or recipients per window
+const RENDERED_EMAIL_CEILING = 1024 * 1024 * 1024; // 1 GB
+const RENDERED_TOTAL_CEILING = 8 * 1024 * 1024 * 1024; // 8 GB
+
 function defaultLimiter(): RateLimiter {
-  const perMin = Number(process.env.RATE_LIMIT_PER_MINUTE ?? 60);
-  const burst = Number(process.env.RATE_LIMIT_BURST ?? 20);
+  const perMin = positiveInt('RATE_LIMIT_PER_MINUTE', 60, { max: MAX_RATE });
+  const burst = positiveInt('RATE_LIMIT_BURST', 20, { max: MAX_RATE });
   return new RateLimiter({ capacity: burst, refillPerSec: perMin / 60 });
 }
 
 /** Pre-auth buckets for the bulk routes — same shape as /send's, own tokens. */
 function defaultBulkPreAuthLimiter(): RateLimiter {
-  const perMin = Number(process.env.BULK_RATE_LIMIT_PER_MINUTE ?? 60);
-  const burst = Number(process.env.BULK_RATE_LIMIT_BURST ?? 20);
+  const perMin = positiveInt('BULK_RATE_LIMIT_PER_MINUTE', 60, { max: MAX_RATE });
+  const burst = positiveInt('BULK_RATE_LIMIT_BURST', 20, { max: MAX_RATE });
   return new RateLimiter({ capacity: burst, refillPerSec: perMin / 60 });
 }
 
 function defaultBulkLimiter(): RateLimiter {
-  const perMin = Number(process.env.BULK_REQUESTS_PER_MINUTE ?? 10);
+  const perMin = positiveInt('BULK_REQUESTS_PER_MINUTE', 10, { max: MAX_RATE });
   return new RateLimiter({ capacity: perMin, refillPerSec: perMin / 60 });
 }
 
 function defaultRecipientLimiter(): RateLimiter {
-  const perHour = Number(process.env.BULK_RECIPIENTS_PER_HOUR ?? 2000);
+  const perHour = positiveInt('BULK_RECIPIENTS_PER_HOUR', 2000, { max: MAX_RATE });
   return new RateLimiter({ capacity: perHour, refillPerSec: perHour / 3600 });
 }
 
@@ -168,10 +174,12 @@ export function createApp(deps: AppDeps): Hono {
   const renderBodies = deps.renderBodies ?? renderRecipients;
   // A 2 MB request can still describe gigabytes of output, so the rendered
   // size is capped separately from the request size.
-  const maxRenderedEmailBytes = Number(process.env.BULK_MAX_RENDERED_EMAIL_BYTES ?? 512 * 1024);
-  const maxRenderedTotalBytes = Number(
-    process.env.BULK_MAX_RENDERED_TOTAL_BYTES ?? 32 * 1024 * 1024,
-  );
+  const maxRenderedEmailBytes = positiveInt('BULK_MAX_RENDERED_EMAIL_BYTES', 512 * 1024, {
+    max: RENDERED_EMAIL_CEILING,
+  });
+  const maxRenderedTotalBytes = positiveInt('BULK_MAX_RENDERED_TOTAL_BYTES', 32 * 1024 * 1024, {
+    max: RENDERED_TOTAL_CEILING,
+  });
 
   app.get('/health', async (c) => {
     try {

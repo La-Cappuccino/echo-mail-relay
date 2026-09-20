@@ -1048,3 +1048,106 @@ test('an ownership lookup failure fails closed, it does not fall through to the 
     console.error = original;
   }
 });
+
+// --- a garbage numeric env must not disable the safeguard it configures ---
+// (Codex round-2 #1). Each case sets the variable to something that used to
+// become NaN/0/Infinity and asserts the limit is still ENFORCED at the route.
+
+const GARBAGE = ['512KB', '', '0', '-5', 'NaN', '1e99'];
+
+/** Silences the one warn line the env helper emits for an invalid value. */
+function quietly<T>(fn: () => T): T {
+  const original = console.error;
+  console.error = () => {};
+  try {
+    return fn();
+  } finally {
+    console.error = original;
+  }
+}
+
+test('BULK_MAX_RENDERED_EMAIL_BYTES garbage → the 512 KB default still refuses an oversized email', async () => {
+  for (const raw of GARBAGE) {
+    const { app, batches } = quietly(() =>
+      withEnv({ BULK_MAX_RENDERED_EMAIL_BYTES: raw }, () => harnessWithRenderSpy()),
+    );
+    // ~600 KB rendered — accepted while the cap was NaN, refused with the default
+    const res = await postBulk(app, KEYS.normal, {
+      tier: 'marketing',
+      subject: 'Big',
+      html: '{{note}}'.repeat(300),
+      recipients: [{ to: 'a@example.com', substitutions: { note: 'x'.repeat(2000) } }],
+    });
+    assert.equal(res.status, 413, `BULK_MAX_RENDERED_EMAIL_BYTES=${JSON.stringify(raw)}`);
+    assert.equal(batches.length, 0);
+  }
+});
+
+test('BULK_MAX_RENDERED_TOTAL_BYTES garbage → the 32 MB default still refuses an oversized batch', async () => {
+  for (const raw of GARBAGE) {
+    const { app, batches } = quietly(() =>
+      withEnv({ BULK_MAX_RENDERED_TOTAL_BYTES: raw }, () => harnessWithRenderSpy()),
+    );
+    // 500 × ~400 KB ≈ 200 MB total, each email under the 512 KB per-email cap
+    const res = await postBulk(app, KEYS.normal, {
+      tier: 'marketing',
+      subject: 'Sum',
+      html: '{{note}}'.repeat(200),
+      recipients: Array.from({ length: 500 }, (_, i) => ({
+        to: `r${i + 1}@example.com`,
+        substitutions: { note: 'x'.repeat(2000) },
+      })),
+    });
+    assert.equal(res.status, 413, `BULK_MAX_RENDERED_TOTAL_BYTES=${JSON.stringify(raw)}`);
+    assert.equal(batches.length, 0);
+  }
+});
+
+test('BULK_RECIPIENTS_PER_HOUR garbage → the 2000 default budget is still enforced', async () => {
+  for (const raw of GARBAGE) {
+    const { app } = quietly(() =>
+      withEnv({ BULK_RECIPIENTS_PER_HOUR: raw }, () =>
+        makeHarness({ recipientLimiter: undefined }),
+      ),
+    );
+    // 2000 recipients of budget = four 500-recipient batches, then refused
+    for (let i = 0; i < 4; i += 1) {
+      const ok = await postBulk(app, KEYS.normal, { ...BASE, recipients: recipients(500) });
+      assert.equal(ok.status, 200, `BULK_RECIPIENTS_PER_HOUR=${JSON.stringify(raw)} call ${i + 1}`);
+    }
+    const refused = await postBulk(app, KEYS.normal, { ...BASE, recipients: recipients(500) });
+    assert.equal(refused.status, 429, `BULK_RECIPIENTS_PER_HOUR=${JSON.stringify(raw)}`);
+  }
+});
+
+test('BULK_RATE_LIMIT_BURST garbage → the default 20-token pre-auth bucket is still enforced', async () => {
+  for (const raw of ['512KB', '0', '-5', 'NaN']) {
+    const { app } = quietly(() =>
+      withEnv({ BULK_RATE_LIMIT_BURST: raw, BULK_RATE_LIMIT_PER_MINUTE: raw }, () =>
+        makeHarness({ bulkIpLimiter: undefined, bulkKeyLimiter: undefined }),
+      ),
+    );
+    const ip = '203.0.113.40';
+    let limited = false;
+    for (let i = 0; i < 25 && !limited; i += 1) {
+      limited = (await postBulk(app, KEYS.normal, BASE, ip)).status === 429;
+    }
+    assert.ok(limited, `BULK_RATE_LIMIT_BURST=${JSON.stringify(raw)} should still rate limit`);
+  }
+});
+
+test('a valid numeric env is honoured exactly, and logs nothing', async () => {
+  const logs: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => logs.push(args.join(' '));
+  try {
+    const { app } = withEnv({ BULK_RECIPIENTS_PER_HOUR: '7' }, () =>
+      makeHarness({ recipientLimiter: undefined }),
+    );
+    assert.equal((await postBulk(app, KEYS.normal, { ...BASE, recipients: recipients(7) })).status, 200);
+    assert.equal((await postBulk(app, KEYS.normal, { ...BASE, recipients: recipients(1) })).status, 429);
+  } finally {
+    console.error = original;
+  }
+  assert.deepEqual(logs, []);
+});

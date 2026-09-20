@@ -1,7 +1,8 @@
 import { serve } from '@hono/node-server';
 import { createApp } from './app.js';
 import { findProjectByKeyHash, logSend, logSends, ownsBulkId, pool } from './db.js';
-import { getBulkStatus, mailersendSend, sendBulkEmail } from './mailersend.js';
+import { bulkTimeoutMs, getBulkStatus, mailersendSend, sendBulkEmail } from './mailersend.js';
+import { positiveInt } from './env.js';
 
 // MailerSend is the sole email provider. Brevo was removed 2026-07-19 (its SMTP
 // account was never activated — 403 for days). The Brevo client and credentials
@@ -23,7 +24,12 @@ const app = createApp({
   },
 });
 
-const port = Number(process.env.PORT ?? 8080);
+// createApp() has already resolved every other numeric setting; touch the
+// provider deadline too so an invalid value is reported at boot rather than
+// on the first bulk send.
+bulkTimeoutMs();
+
+const port = positiveInt('PORT', 8080, { max: 65535 });
 serve({ fetch: app.fetch, port }, () => {
   console.log(`echo-mail-relay listening on :${port}`);
 });

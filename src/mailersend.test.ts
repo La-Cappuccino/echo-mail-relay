@@ -4,6 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  bulkTimeoutMs,
   getBulkStatus,
   MailerSendError,
   mailersendSend,
@@ -543,4 +544,47 @@ test('a normal response still resolves well inside the deadline', async () => {
   } finally {
     restoreFetch();
   }
+});
+
+test('a garbage MAILERSEND_TIMEOUT_MS falls back to 15s — a normal response is NOT aborted', async () => {
+  // These used to produce NaN/0/negative, which aborts within a millisecond
+  // and turns every send into `unknown` — the worst possible failure mode.
+  for (const raw of ['512KB', '', '0', '-5', 'NaN', '1e99', '-1']) {
+    stubFetch(() => accepted('bulk-env'));
+    const original = console.error;
+    console.error = () => {};
+    try {
+      const result = await withEnv({ [API_KEY_ENV]: 'test-key', [TIMEOUT_ENV]: raw }, () =>
+        sendBulkEmail([INPUT]),
+      );
+      assert.deepEqual(result, { bulkEmailId: 'bulk-env' }, JSON.stringify(raw));
+    } finally {
+      console.error = original;
+      restoreFetch();
+    }
+  }
+});
+
+test('a timeout above the 120s ceiling falls back to the default', async () => {
+  const original = console.error;
+  const logs: string[] = [];
+  console.error = (...args: unknown[]) => logs.push(args.join(' '));
+  try {
+    await withEnv({ [TIMEOUT_ENV]: '999999999' }, async () => {
+      assert.equal(bulkTimeoutMs(), 15_000);
+    });
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /invalid MAILERSEND_TIMEOUT_MS=999999999, using default 15000/);
+  } finally {
+    console.error = original;
+  }
+});
+
+test('a valid timeout inside the ceiling is honoured', async () => {
+  await withEnv({ [TIMEOUT_ENV]: '30000' }, async () => {
+    assert.equal(bulkTimeoutMs(), 30_000);
+  });
+  await withEnv({ [TIMEOUT_ENV]: undefined }, async () => {
+    assert.equal(bulkTimeoutMs(), 15_000);
+  });
 });
