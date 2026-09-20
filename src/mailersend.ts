@@ -55,6 +55,11 @@ export interface BulkStatus {
   raw: unknown;
 }
 
+/** Overridable only so tests need not wait out the real 15 s deadline. */
+function bulkTimeoutMs(): number {
+  return Number(process.env.MAILERSEND_TIMEOUT_MS ?? BULK_TIMEOUT_MS);
+}
+
 function listUnsubscribeEnabled(): boolean {
   return process.env.MAILERSEND_LIST_UNSUBSCRIBE === 'true';
 }
@@ -102,15 +107,28 @@ export async function mailersendSend(input: MailerSendInput): Promise<{ messageI
   return { messageId: res.headers.get('x-message-id') ?? '' };
 }
 
-/** 15 s ceiling on every bulk call; a timeout is indistinguishable from a slow accept. */
-async function bulkFetch(url: string, init: RequestInit): Promise<Response> {
+/** The response, fully read. Reading the body is part of the timed operation. */
+interface BulkResponse {
+  ok: boolean;
+  status: number;
+  headers: Headers;
+  body: string;
+}
+
+/**
+ * Every bulk call under one deadline — and the deadline stays armed while the
+ * body is read. Clearing it at the status line would let a provider that
+ * sends headers and then stalls the body hang the relay indefinitely.
+ */
+async function bulkFetch(url: string, init: RequestInit): Promise<BulkResponse> {
   const apiKey = process.env.MAILERSEND_API_KEY;
   if (!apiKey) throw new MailerSendError('MAILERSEND_API_KEY not configured', 'rejected');
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), BULK_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), bulkTimeoutMs());
+  let res: Response | undefined;
   try {
-    return await fetch(url, {
+    res = await fetch(url, {
       ...init,
       signal: controller.signal,
       headers: {
@@ -119,21 +137,33 @@ async function bulkFetch(url: string, init: RequestInit): Promise<Response> {
         accept: 'application/json',
       },
     });
+    return { ok: res.ok, status: res.status, headers: res.headers, body: await res.text() };
   } catch (err) {
-    // Timeout or network error: the request may have reached MailerSend.
     const message = err instanceof Error ? err.message : 'network error';
-    throw new MailerSendError(`MailerSend request failed: ${message}`, 'unknown');
+    // A 4xx status line is already proof the provider refused, even if the
+    // body never arrived. Everything else — including an abort AFTER a 2xx —
+    // may have been accepted, so it is unknown, never rejected.
+    const outcome: SendOutcome =
+      res && res.status >= 400 && res.status < 500 ? 'rejected' : 'unknown';
+    throw new MailerSendError(`MailerSend request failed: ${message}`, outcome);
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function throwForStatus(res: Response, what: string): Promise<never> {
-  const body = await res.text().catch(() => '');
+function statusError(res: BulkResponse, what: string): MailerSendError {
   // 4xx is the provider refusing the request — provably nothing was sent.
   // 5xx could be a failure after the batch was queued.
   const outcome: SendOutcome = res.status >= 400 && res.status < 500 ? 'rejected' : 'unknown';
-  throw new MailerSendError(`MailerSend ${what} ${res.status}: ${body.slice(0, 500)}`, outcome);
+  return new MailerSendError(`MailerSend ${what} ${res.status}: ${res.body.slice(0, 500)}`, outcome);
+}
+
+function parseJson(body: string): unknown {
+  try {
+    return JSON.parse(body);
+  } catch {
+    return null;
+  }
 }
 
 export async function sendBulkEmail(
@@ -148,7 +178,7 @@ export async function sendBulkEmail(
     body: JSON.stringify(inputs.map(emailBody)),
   });
 
-  if (!res.ok) await throwForStatus(res, 'bulk');
+  if (!res.ok) throw statusError(res, 'bulk');
 
   if (res.headers.get('x-send-paused') === 'true') {
     throw new MailerSendError(
@@ -159,7 +189,7 @@ export async function sendBulkEmail(
 
   // 202 carries {message, bulk_email_id}. Without a usable id the batch cannot
   // be reconciled later, so it is `unknown` rather than a success with no id.
-  const payload = (await res.json().catch(() => null)) as { bulk_email_id?: unknown } | null;
+  const payload = parseJson(res.body) as { bulk_email_id?: unknown } | null;
   const bulkEmailId = payload?.bulk_email_id;
   if (typeof bulkEmailId !== 'string' || bulkEmailId === '') {
     throw new MailerSendError(
@@ -175,9 +205,9 @@ export async function getBulkStatus(bulkEmailId: string): Promise<BulkStatus> {
     method: 'GET',
   });
 
-  if (!res.ok) await throwForStatus(res, 'bulk status');
+  if (!res.ok) throw statusError(res, 'bulk status');
 
-  const raw = (await res.json().catch(() => null)) as { data?: Record<string, unknown> } | null;
+  const raw = parseJson(res.body) as { data?: Record<string, unknown> } | null;
   if (!raw) throw new MailerSendError('MailerSend bulk status: unparseable body', 'unknown');
   const data = raw.data ?? {};
   return {

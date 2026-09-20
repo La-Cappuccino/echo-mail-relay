@@ -450,3 +450,97 @@ test('status: 404 → rejected, 500 → unknown, network error → unknown', asy
     }
   }
 });
+
+// --- the deadline must cover the body, not just the headers (Codex #5) ---
+
+const TIMEOUT_ENV = 'MAILERSEND_TIMEOUT_MS';
+
+/** Headers arrive, then the body never does — until the request is aborted. */
+function stallingBody(status: number) {
+  return (call: StubCall): Response => {
+    const signal = call.init.signal as AbortSignal | undefined;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const abort = () =>
+          controller.error(Object.assign(new Error('This operation was aborted'), {
+            name: 'AbortError',
+          }));
+        if (!signal) return; // no signal → the stream really would hang
+        if (signal.aborted) abort();
+        else signal.addEventListener('abort', abort);
+      },
+    });
+    return new Response(stream, { status });
+  };
+}
+
+test('a 2xx whose body stalls aborts and classifies as unknown — it may have been accepted', async () => {
+  stubFetch(stallingBody(202));
+  try {
+    await withEnv({ [API_KEY_ENV]: 'test-key', [TIMEOUT_ENV]: '50' }, async () => {
+      await assert.rejects(sendBulkEmail([INPUT]), (err: Error) => {
+        assert.ok(err instanceof MailerSendError);
+        assert.equal(err.outcome, 'unknown', 'a 2xx that stalled must never be "rejected"');
+        return true;
+      });
+    });
+  } finally {
+    restoreFetch();
+  }
+});
+
+test('a 4xx whose body stalls is still rejected — the status line is proof enough', async () => {
+  stubFetch(stallingBody(422));
+  try {
+    await withEnv({ [API_KEY_ENV]: 'test-key', [TIMEOUT_ENV]: '50' }, async () => {
+      await assert.rejects(sendBulkEmail([INPUT]), (err: Error) => {
+        assert.ok(err instanceof MailerSendError);
+        assert.equal(err.outcome, 'rejected');
+        return true;
+      });
+    });
+  } finally {
+    restoreFetch();
+  }
+});
+
+test('a 5xx whose body stalls stays unknown', async () => {
+  stubFetch(stallingBody(503));
+  try {
+    await withEnv({ [API_KEY_ENV]: 'test-key', [TIMEOUT_ENV]: '50' }, async () => {
+      await assert.rejects(sendBulkEmail([INPUT]), (err: Error) => {
+        assert.equal((err as MailerSendError).outcome, 'unknown');
+        return true;
+      });
+    });
+  } finally {
+    restoreFetch();
+  }
+});
+
+test('the status read is bounded by the same deadline', async () => {
+  stubFetch(stallingBody(200));
+  try {
+    await withEnv({ [API_KEY_ENV]: 'test-key', [TIMEOUT_ENV]: '50' }, async () => {
+      await assert.rejects(getBulkStatus('bulk-1'), (err: Error) => {
+        assert.ok(err instanceof MailerSendError);
+        assert.equal(err.outcome, 'unknown');
+        return true;
+      });
+    });
+  } finally {
+    restoreFetch();
+  }
+});
+
+test('a normal response still resolves well inside the deadline', async () => {
+  stubFetch(() => accepted('bulk-ok'));
+  try {
+    const result = await withEnv({ [API_KEY_ENV]: 'test-key', [TIMEOUT_ENV]: '2000' }, () =>
+      sendBulkEmail([INPUT]),
+    );
+    assert.deepEqual(result, { bulkEmailId: 'bulk-ok' });
+  } finally {
+    restoreFetch();
+  }
+});
