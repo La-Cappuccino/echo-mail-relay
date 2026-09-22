@@ -1,7 +1,7 @@
 {
   "name": "echo-mail-relay",
   "version": "0.1.0",
-  "description": "Central email control plane for all Echo products — single Brevo backend, per-project kill-switches, full send log.",
+  "description": "Central email control plane for all Echo products — single MailerSend backend, per-project kill-switches, full send log.",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
