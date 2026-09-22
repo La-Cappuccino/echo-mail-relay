@@ -9,7 +9,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "migrate": "tsx src/migrate.ts",
-    "test": "tsx src/index.test.ts"
+    "test": "tsx --test src/*.test.ts"
   },
   "dependencies": {
     "@hono/node-server": "^1.13.0",
